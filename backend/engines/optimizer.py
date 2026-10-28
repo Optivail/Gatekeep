@@ -891,16 +891,25 @@ def optimize_payload(
     return payload, categories
 
 
-def compute_request_hash(payload: dict, provider: str) -> str:
-    """Cache key over the semantically-relevant part of a request (provider +
-    model + system + full message history). Computed on the ORIGINAL,
-    pre-optimization payload so it reflects what the client actually asked,
-    independent of anything this module does to it turn to turn."""
+_CREDENTIAL_HEADERS = ("authorization", "x-api-key", "x-goog-api-key", "api-key")
+
+
+def credential_fingerprint(headers) -> str:
+    """Short digest of the caller's upstream credential, so one caller never
+    gets a response that was cached for another (or for a valid key)."""
+    parts = [f"{h}={(headers.get(h) or '').strip()}" for h in _CREDENTIAL_HEADERS]
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
+def compute_request_hash(payload: dict, provider: str, credential: str = "") -> str:
+    """Cache key over the whole ORIGINAL, pre-optimization request plus the
+    caller's credential fingerprint. Every field counts (tools, stream,
+    max_tokens, ...): two requests that differ in any of them must not share
+    a cached response."""
     key_payload = {
         "provider": provider,
-        "model": payload.get("model"),
-        "system": payload.get("system"),
-        "messages": payload.get("messages"),
+        "credential": credential,
+        "payload": payload,
     }
     return hashlib.sha256(canonical_json_dumps(key_payload)).hexdigest()
 

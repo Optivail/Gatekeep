@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hmac
 import os
 
 from dotenv import load_dotenv
@@ -53,8 +54,8 @@ def is_authorized(request) -> bool:
     if not API_KEY:
         return True
     auth = (request.headers.get("authorization") or "").strip()
-    if auth.lower().startswith("bearer ") and auth[7:].strip() == API_KEY:
+    if auth.lower().startswith("bearer ") and hmac.compare_digest(auth[7:].strip().encode(), API_KEY.encode()):
         return True
-    if (request.headers.get("x-gatekeep-key") or "").strip() == API_KEY:
+    if hmac.compare_digest((request.headers.get("x-gatekeep-key") or "").strip().encode(), API_KEY.encode()):
         return True
     return False

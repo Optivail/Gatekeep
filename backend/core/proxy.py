@@ -266,7 +266,9 @@ async def forward_request(request: Request, path: str) -> Response:
             if should_cache:
                 from engines import extras
 
-                request_hash = optimizer.compute_request_hash(payload, provider)
+                request_hash = optimizer.compute_request_hash(
+                    payload, provider, optimizer.credential_fingerprint(request.headers)
+                )
                 # Cheap sample for cache-hit log only
                 original_sample = str(payload.get("model") or "")[:200]
                 cached = await asyncio.to_thread(database.get_cached_response, request_hash)
