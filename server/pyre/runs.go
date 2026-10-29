@@ -13,6 +13,8 @@ import (
 type runPattern struct {
 	set charSet
 	min int
+	// ascii[c] is set.has(c) for c < 128, so the common bytes skip the search.
+	ascii [128]bool
 }
 
 // runFor returns the run form of root, or nil when root is not that shape.
@@ -24,7 +26,11 @@ func runFor(root *node) *runPattern {
 	if sub.kind != nSet {
 		return nil
 	}
-	return &runPattern{set: sub.set, min: root.min}
+	rp := &runPattern{set: sub.set, min: root.min}
+	for c := range rp.ascii {
+		rp.ascii[c] = sub.set.has(rune(c))
+	}
+	return rp
 }
 
 // has reports whether r is in the set, by binary search over the spans.
@@ -53,7 +59,13 @@ func (rp *runPattern) matches(s string, n int) [][]int {
 		if r >= utf8.RuneSelf {
 			r, w = utf8.DecodeRuneInString(s[i:])
 		}
-		if rp.set.has(r) {
+		var in bool
+		if r < utf8.RuneSelf {
+			in = rp.ascii[r]
+		} else {
+			in = rp.set.has(r)
+		}
+		if in {
 			if start < 0 {
 				start = i
 			}

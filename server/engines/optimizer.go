@@ -145,6 +145,9 @@ func splitCaptured(re *pyre.Regexp, s string) []string {
 // cavemanWords strips filler, polite prefixes and articles from prose. The
 // \b boundaries keep identifiers and paths intact.
 func cavemanWords(text string) string {
+	if isASCII(text) {
+		return cavemanWordsASCII(text) // exact; see caveman_ascii.go
+	}
 	text = reFillerPreamble.Sub("", text)
 	text = rePoliteAux.Sub("", text)
 	text = reDeterminers.Sub("", text)
@@ -153,9 +156,7 @@ func cavemanWords(text string) string {
 
 // cleanProse compresses text outside code fences.
 func cleanProse(text string) string {
-	for _, p := range fillerPatterns {
-		text = p.Sub("", text)
-	}
+	text = stripFillers(text)
 	segments := splitCaptured(reInlineCodeSplit, text)
 	var b strings.Builder
 	for i, seg := range segments {

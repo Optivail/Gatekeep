@@ -338,10 +338,15 @@ func (re *Regexp) Split(s string, maxsplit int) []string {
 // same context before each search position. n is scan's limit: negative
 // means no limit. ok is false when the scan must run on regexp2.
 func (re *Regexp) allRE2(s string, n int) (locs [][]int, ok bool) {
-	if !re.nonNull || !utf8.ValidString(s) || hasSurrogateBytes(s) {
+	if !re.nonNull {
 		return nil, false
 	}
-	if re.prefix != "" && isASCII(s) && !containsFoldASCII(s, re.prefix) {
+	// ASCII input is valid UTF-8 without surrogates, so one scan settles both.
+	ascii := isASCII(s)
+	if !ascii && (!utf8.ValidString(s) || hasSurrogateBytes(s)) {
+		return nil, false
+	}
+	if re.prefix != "" && ascii && !containsFoldASCII(s, re.prefix) {
 		return nil, true
 	}
 	if re.run != nil {
@@ -353,7 +358,7 @@ func (re *Regexp) allRE2(s string, n int) (locs [][]int, ok bool) {
 	if re.re2 != nil {
 		return re.re2.FindAllStringIndex(s, n), true
 	}
-	if re.reASCII != nil && isASCII(s) {
+	if re.reASCII != nil && ascii {
 		return re.reASCII.FindAllStringIndex(s, n), true
 	}
 	return nil, false
