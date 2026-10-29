@@ -33,18 +33,17 @@ var (
 	repoDir         = "."
 )
 
-// dashboardAPI are the exact paths that skip the API-key check, as
-// _DASHBOARD_API does. Note that /api/data/clear and /api/prices/refresh are
-// in this list, so they stay open even when a key is set. That is the
-// reference behaviour and it is kept deliberately.
+// dashboardAPI are the exact paths that skip the API-key check. Read-only
+// dashboard data is open, as in _DASHBOARD_API. /api/data/clear and
+// /api/prices/refresh are deliberately NOT here: they change state, so they
+// need the key when one is set. This is a documented fix (KNOWN in the HTTP
+// parity harness), because the Python reference leaves them open.
 var dashboardAPI = []string{
 	"/api/stats",
 	"/api/settings",
 	"/api/logs",
 	"/api/prices",
 	"/api/server-info",
-	"/api/data/clear",
-	"/api/prices/refresh",
 }
 
 // catchAllMethods are the methods FastAPI's catch-all route accepts.

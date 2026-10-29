@@ -105,14 +105,20 @@ func TestAPIKeyMiddlewareExemptions(t *testing.T) {
 	setupTestDB(t)
 	// Exempt paths must not get a 401 even without a key.
 	for _, p := range []string{"/api/stats", "/api/logs", "/api/settings", "/api/prices",
-		"/api/server-info", "/api/data/clear", "/api/prices/refresh", "/api/settings/x", "/install/wire-agents.ps1", "/dashboard"} {
+		"/api/server-info", "/api/settings/x", "/install/wire-agents.ps1", "/dashboard"} {
 		method := http.MethodGet
-		if p == "/api/data/clear" || p == "/api/prices/refresh" || p == "/api/settings/x" {
+		if p == "/api/settings/x" {
 			method = http.MethodPost
 		}
 		rec := do(t, method, p, "", nil)
 		if rec.Code == http.StatusUnauthorized {
 			t.Errorf("%s %s was rejected, but it is exempt", method, p)
+		}
+	}
+	// State-changing dashboard actions need the key even though they sit under /api/.
+	for _, p := range []string{"/api/data/clear", "/api/prices/refresh"} {
+		if rec := do(t, http.MethodPost, p, "", nil); rec.Code != http.StatusUnauthorized {
+			t.Errorf("POST %s without key: status %d, want 401", p, rec.Code)
 		}
 	}
 	// Anything else needs the key, and the 401 body matches FastAPI's.
