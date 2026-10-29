@@ -53,6 +53,9 @@ KNOWN: dict[str, str] = {
     "header:content-length": ("Python sends Content-Length for a buffered SSE body; Go streams it chunked. "
                               "Body bytes are compared and identical; only framing differs"),
     "header:keep-alive": "hop-by-hop",
+    "auth:/api/data/clear": ("Documented fix: Go requires the API key on POST /api/data/clear. The Python "
+                             "reference exempts it, so an unauthenticated clear succeeds there and returns 401 here"),
+    "auth:/api/prices/refresh": ("Documented fix: Go requires the API key on POST /api/prices/refresh (see above)"),
     "header:last-modified": "static file mtime on disk; differs between two checkouts, not a server behaviour",
     "header:etag": "Go static file serving omits ETag; body bytes identical (cosmetic, cache validation only)",
     "header:cache-control": ("Intentional: Go sends no-cache on every served .html, including /dashboard/ "
