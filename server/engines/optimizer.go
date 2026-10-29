@@ -540,12 +540,26 @@ func truncateVerboseLogs(text string) (string, error) {
 	return strings.Join(out, "\n"), nil
 }
 
-// pythonFenceUnsupported reports whether a fenced block starts with ```python.
-// Python swaps such a block for an ast.unparse signature stub when the stub
-// differs from the original. This port has no Python parser or unparser, so
-// any such block is reported as unsupported instead of guessed.
-func pythonFenceUnsupported(seg string) bool {
-	return rePythonFence.FindSubmatchIndex(seg) != nil
+// pythonFenceStub mirrors the first branch of _prune_middle_content for a
+// fenced block. A block that matches ```python ... ``` is distilled to its
+// public signatures (distillPythonSignatures, pyast.go). The stub replaces the
+// block only when it is non-blank and differs from the original code. ok is
+// false when Python would fall through to the truncation branches. err is
+// ErrUnsupported when the distiller declines the input.
+func pythonFenceStub(seg string) (stub string, ok bool, err error) {
+	loc := rePythonFence.FindSubmatchIndex(seg)
+	if loc == nil {
+		return "", false, nil
+	}
+	code := seg[loc[2]:loc[3]]
+	distilled, err := distillPythonSignatures(code)
+	if err != nil {
+		return "", false, err
+	}
+	if distilled == "" || pyStrip(distilled) == "" || distilled == code {
+		return "", false, nil
+	}
+	return distilled, true, nil
 }
 
 // pruneMiddleContent mirrors _prune_middle_content. Falsy values pass through
@@ -564,8 +578,14 @@ func pruneMiddleContent(text any, logTruncation bool) (any, error) {
 		lines := strings.Split(seg, "\n")
 		if i%2 == 1 {
 			// Fenced code block, fence lines included.
-			if pythonFenceUnsupported(seg) {
-				return nil, ErrUnsupported
+			stub, stubbed, err := pythonFenceStub(seg)
+			if err != nil {
+				return nil, err
+			}
+			if stubbed {
+				// Python reference code: the signature stub always wins.
+				out.WriteString("```python\n" + stub + "\n```")
+				continue
 			}
 			if logTruncation && len(lines) > logTruncateMinLines {
 				t, err := truncateVerboseLogs(seg)

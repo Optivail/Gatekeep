@@ -114,3 +114,5 @@ jobs:
           GK_PARITY_CORPUS="$RUNNER_TEMP/engines.jsonl" go test -count=1 -run Parity -v ./engines
       - name: HTTP parity (both servers, fake upstream)
         run: python -I server/parity/http_parity.py --go-bin "$RUNNER_TEMP/gatekeep-go" --py-dir backend
+      - name: SQLite round trip (Python and Go share one database)
+        run: python -I server/parity/db_roundtrip.py --go-bin "$RUNNER_TEMP/gatekeep-go"

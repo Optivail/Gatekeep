@@ -1,6 +1,6 @@
 // Command server is the Go port of the Gatekeep backend. It serves the
-// dashboard API and the static dashboard. The LLM proxy forwarding is still
-// a stub (forward.go), and the cursor agent listener is not ported yet.
+// dashboard API, the static dashboard, the LLM proxy (forward.go) and, on its
+// own port, the Cursor agent listener (cursor_agent_server.go).
 package main
 
 import (
@@ -40,31 +40,36 @@ func main() {
 	}
 	logger.Info(fmt.Sprintf("[PROXY] Gatekeep listening config host=%s port=%d", cfgHost, cfgPort))
 
+	// The agent listener is a separate port. A failure to bind it is logged and
+	// the dashboard and the proxy keep running, as in Python.
+	var agentSrv *http.Server
 	if agentDisabled(os.Getenv("GATEKEEP_DISABLE_AGENT")) {
 		logger.Debug("[PROXY] Cursor agent listener disabled (GATEKEEP_DISABLE_AGENT)")
 	} else {
-		// The cursor listener is not ported. Its port is deliberately not
-		// opened, so the warning makes the gap visible.
-		logger.Warn(fmt.Sprintf(
-			"[PROXY] cursor agent listener (%s:%d) is not implemented in the Go server yet and was not started; "+
-				"set GATEKEEP_DISABLE_AGENT=1 to silence this warning", cfgAgentHost, cfgAgentPort))
+		srv, err := startAgentListener(cfgAgentHost, cfgAgentPort)
+		if err != nil {
+			logger.Error(fmt.Sprintf("[PROXY] cursor agent listener %s:%d failed to start: %v", cfgAgentHost, cfgAgentPort, err))
+		} else {
+			agentSrv = srv
+			logger.Info(fmt.Sprintf("[PROXY] Agent URL rewrite target: %s (listener %s:%d)",
+				agentPublicURL(), cfgAgentHost, cfgAgentPort))
+			go warmUpstream(defaultAgentUpstream)
+		}
 	}
 
-	// Python awaits this before serving. Here it runs in the background so
-	// that a slow or failing price download does not delay startup.
-	go func() {
-		res := maybeAutoRefresh()
-		if res == nil {
-			return
-		}
+	// Python's lifespan awaits this before serving, so the listener opens only
+	// after the price table is current. Running it in the background made the
+	// first dashboard reads see stale prices. The download is bounded by the
+	// same HTTP timeout as the Python reference.
+	if res := maybeAutoRefresh(); res != nil {
 		if e, ok := res.Get("error"); ok {
 			logger.Warn(fmt.Sprintf("[PRICING] auto-refresh failed: %v", e))
-			return
+		} else {
+			models, _ := res.Get("models")
+			updated, _ := res.Get("updated_at")
+			logger.Info(fmt.Sprintf("[PRICING] auto-refreshed %v models @ %v", models, updated))
 		}
-		models, _ := res.Get("models")
-		updated, _ := res.Get("updated_at")
-		logger.Info(fmt.Sprintf("[PRICING] auto-refreshed %v models @ %v", models, updated))
-	}()
+	}
 
 	ln, err := net.Listen("tcp", listenAddr())
 	if err != nil {
@@ -89,6 +94,12 @@ func main() {
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			logger.Error("[PROXY] shutdown error", "err", err)
+		}
+		// Python cancels the agent task, which drops its streams at once.
+		if agentSrv != nil {
+			if err := agentSrv.Close(); err != nil {
+				logger.Error("[PROXY] agent listener close error", "err", err)
+			}
 		}
 	}
 }

@@ -182,9 +182,14 @@ func DecompressConnectBody(body []byte) ([]byte, error) {
 // MapFramePayloads mirrors map_frame_payloads. fn is applied to each frame
 // payload (inflated first when flagged). ok reports whether the body changed.
 //
-// Caveat: a changed gzip-flagged frame is re-compressed with gzipCompress,
-// which is not byte-identical to Python's zlib output. Its decompressed
-// content matches; only the deflate bytes and the mtime differ.
+// Limitation (not reproducible, by design): a changed gzip-flagged frame is
+// re-compressed with gzipCompress (compress/gzip at level 6). Python's
+// gzip.compress(mapped, compresslevel=6) writes the current time into the
+// header, so its output changes between runs, and its deflate bytes come from
+// zlib, which Go's compress/flate does not reproduce. With the mtime fixed,
+// Python's output is byte-stable, but Go's bytes still differ from it. The
+// decoded payload and the frame flags and lengths match, and the corpus
+// compares those (parity_adapters_decl_test.go).
 func MapFramePayloads(body []byte, fn func([]byte) []byte, skipEndStream bool) ([]byte, bool, error) {
 	frames, ok := IterFrames(body)
 	if !ok {

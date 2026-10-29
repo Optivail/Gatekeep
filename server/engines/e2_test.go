@@ -148,8 +148,20 @@ func TestGzipChangedFrameDeclines(t *testing.T) {
 	payload := zb.Bytes()
 	frame := append([]byte{0x01, 0, 0, 0, 0}, payload...)
 	frame[1], frame[2], frame[3], frame[4] = byte(len(payload)>>24), byte(len(payload)>>16), byte(len(payload)>>8), byte(len(payload))
-	if _, _, err := CrushConnectBody(frame, false, nil); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("err = %v, want ErrUnsupported for a changed gzip frame", err)
+	// A changed gzip frame is re-compressed (decoded-level parity; the gzip bytes
+	// cannot match Python's, which embed the time). Its payload must decode to
+	// the same crushed message as the plain-frame case below.
+	gzOut, _, err := CrushConnectBody(frame, false, nil)
+	if err != nil {
+		t.Fatalf("changed gzip frame: %v", err)
+	}
+	gzFrames, ok := IterFrames(gzOut)
+	if !ok || len(gzFrames) != 1 || gzFrames[0].Flags&0x01 == 0 {
+		t.Fatalf("recompressed frame: ok=%v frames=%v", ok, gzFrames)
+	}
+	gzPayload, err := gzipDecompress(gzFrames[0].Payload)
+	if err != nil {
+		t.Fatalf("gunzip recompressed payload: %v", err)
 	}
 
 	// The same message as a plain frame crushes without declining.
@@ -162,6 +174,13 @@ func TestGzipChangedFrameDeclines(t *testing.T) {
 	}
 	if saved <= 0 || len(out) >= len(plain) {
 		t.Fatalf("plain frame saved=%d len %d->%d, want a crush", saved, len(plain), len(out))
+	}
+	plainFrames, ok := IterFrames(out)
+	if !ok || len(plainFrames) != 1 {
+		t.Fatalf("plain crushed frame: ok=%v", ok)
+	}
+	if !bytes.Equal(gzPayload, plainFrames[0].Payload) {
+		t.Fatalf("decoded payload differs: gzip frame %q, plain frame %q", gzPayload, plainFrames[0].Payload)
 	}
 }
 

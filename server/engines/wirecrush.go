@@ -859,7 +859,6 @@ func mapFramePayloads(body []byte, fn func([]byte) ([]byte, error)) ([]byte, boo
 	}
 	out := make([]Frame, 0, len(frames))
 	changed := false
-	recompressed := false
 	for _, f := range frames {
 		if f.Flags&0x02 != 0 {
 			out = append(out, f)
@@ -887,17 +886,16 @@ func mapFramePayloads(body []byte, fn func([]byte) ([]byte, error)) ([]byte, boo
 			changed = true
 		}
 		if compressed {
-			recompressed = true
-			out = append(out, Frame{Flags: f.Flags, Payload: mapped})
+			// Re-compressed at level 6 like Python. Byte-identical output is not
+			// possible (Python's gzip header carries the current time), so parity
+			// holds at the decoded payload level; see connect_frames.go.
+			out = append(out, Frame{Flags: f.Flags | 0x01, Payload: gzipCompress(mapped)})
 		} else {
 			out = append(out, Frame{Flags: f.Flags, Payload: mapped})
 		}
 	}
 	if !changed {
 		return body, false, nil
-	}
-	if recompressed {
-		return nil, false, ErrUnsupported
 	}
 	enc, err := EncodeFrames(out)
 	if err != nil {

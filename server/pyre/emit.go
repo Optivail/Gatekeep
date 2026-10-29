@@ -32,6 +32,23 @@ func needsBacktrack(n *node) bool {
 	return false
 }
 
+// needsBacktrackASCII is needsBacktrack for input known to be ASCII: \b and
+// \B are then expressible in RE2 as well.
+func needsBacktrackASCII(n *node) bool {
+	switch n.kind {
+	case nLook:
+		return true
+	case nAssert:
+		return n.assert == aDollar
+	}
+	for _, s := range n.subs {
+		if needsBacktrackASCII(s) {
+			return true
+		}
+	}
+	return false
+}
+
 // fixedWidth returns the width in code points of every match of n, or -1 if
 // the width varies. Lookbehind bodies must be fixed-width in CPython.
 func fixedWidth(n *node) int {
@@ -83,6 +100,9 @@ func validateLookbehind(pat string, n *node) {
 type writer struct {
 	sb  strings.Builder
 	re2 bool
+	// asciiWord makes \b and \B RE2's ASCII boundaries. They equal Python's
+	// Unicode boundaries only on ASCII input, so the caller must check that.
+	asciiWord bool
 }
 
 var (
@@ -152,6 +172,16 @@ func (w *writer) assert(a assertKind) {
 			w.sb.WriteString(`(?m:^)`)
 		case aLineEnd:
 			w.sb.WriteString(`(?m:$)`)
+		case aWordB:
+			if !w.asciiWord {
+				panic("pyre: assertion not expressible in RE2")
+			}
+			w.sb.WriteString(`\b`)
+		case aNotWordB:
+			if !w.asciiWord {
+				panic("pyre: assertion not expressible in RE2")
+			}
+			w.sb.WriteString(`\B`)
 		default:
 			panic("pyre: assertion not expressible in RE2")
 		}
@@ -255,6 +285,14 @@ func (w *writer) quant(n *node) {
 // needsBacktrack first.
 func emitRE2(n *node) string {
 	w := &writer{re2: true}
+	w.node(n)
+	return w.sb.String()
+}
+
+// emitRE2ASCII renders the tree for RE2 on ASCII input only. Callers must
+// check needsBacktrackASCII first and the input for ASCII.
+func emitRE2ASCII(n *node) string {
+	w := &writer{re2: true, asciiWord: true}
 	w.node(n)
 	return w.sb.String()
 }

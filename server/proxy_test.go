@@ -397,35 +397,7 @@ func TestProxyChatGPTIsNeverCached(t *testing.T) {
 	}
 }
 
-// ---- NOT PORTED and ErrUnsupported ----------------------------------------------
-
-func TestProxyCursorIsNotPorted(t *testing.T) {
-	setupTestDB(t)
-	up := newFakeUpstream(t, replyWith(200, "application/json", `{}`))
-	t.Setenv("CURSOR_BASE_URL", up.URL)
-
-	cases := []struct {
-		path string
-		hdr  map[string]string
-	}{
-		{"v1/messages", map[string]string{"x-gatekeep-provider": "cursor"}},
-		{"agent.v1.AgentService/Run", nil},
-		{"v1/messages", map[string]string{"content-type": "application/connect+proto"}},
-	}
-	for _, tc := range cases {
-		rec := callProxy("POST", tc.path, "", []byte(anthropicBody), tc.hdr)
-		if rec.Code != http.StatusNotImplemented {
-			t.Fatalf("%s: status %d, want 501", tc.path, rec.Code)
-		}
-		var detail map[string]string
-		if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil || !strings.Contains(detail["detail"], "NOT PORTED") {
-			t.Fatalf("%s: body %q is not the NOT PORTED JSON", tc.path, rec.Body.String())
-		}
-	}
-	if up.count() != 0 {
-		t.Fatalf("a cursor request reached an upstream (calls=%d)", up.count())
-	}
-}
+// ---- ErrUnsupported ----------------------------------------------------------
 
 // Both ErrUnsupported cases must forward the ORIGINAL bytes, as the policy says.
 func TestProxyErrUnsupportedForwardsOriginalBody(t *testing.T) {
@@ -448,9 +420,8 @@ func TestProxyErrUnsupportedForwardsOriginalBody(t *testing.T) {
 		if c.Header.Get("Content-Encoding") != "zstd" {
 			t.Fatalf("Content-Encoding %q, want zstd kept", c.Header.Get("Content-Encoding"))
 		}
-		if _, category, _, _ := lastLog(t); category != "unoptimized" {
-			t.Fatalf("category %q, want unoptimized", category)
-		}
+		// Not a valid zstd frame: python-zstandard fails, and decode_request_body
+		// returns the body unchanged with no error, so no decline is logged.
 	})
 
 	t.Run("UTF-16 JSON wire body", func(t *testing.T) {

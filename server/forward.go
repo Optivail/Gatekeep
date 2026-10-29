@@ -5,9 +5,10 @@ package main
 // (proxy_optimize.go), answered from the response cache when the exact request
 // was seen before, and otherwise streamed from the upstream provider.
 //
-// NOT PORTED: the Cursor agent (core/cursor_agent*.py, backend/agent_app.py),
-// the GetServerConfig rewrite, and the cursor branches of the wire crush.
-// A request that resolves to provider "cursor" gets a 501 with a JSON detail.
+// Cursor: a POST to agent.v1.* is the agent duplex (cursor_agent.go), a
+// GetServerConfig call is rewritten (cursor_agent.go), and any other cursor
+// request takes the generic wire path. The agent listener is in
+// cursor_agent_server.go.
 //
 // Known divergences from Python, all deliberate:
 //   - ErrUnsupported (an engine declines the input): the original body is
@@ -115,8 +116,11 @@ type proxyCall struct {
 // leading slash, as FastAPI's {path:path} route gives it.
 func forwardRequest(w http.ResponseWriter, r *http.Request, path string) {
 	raw := requestHeaderMap(r)
-	if resolveProvider(raw, path, "") == "cursor" {
-		refuseCursor(w, path)
+	// The provider as the request headers and path alone give it. Python's first
+	// resolve_provider call uses no model.
+	provider := resolveProvider(raw, path, "")
+	if provider == "cursor" && r.Method == http.MethodPost && strings.HasPrefix(strings.ToLower(strings.TrimLeft(path, "/")), "agent.v1.") {
+		forwardAgentBidi(w, r, path, forwardableHeaders(raw), baseURLForPath(provider, path))
 		return
 	}
 	c := &proxyCall{w: w, r: r, path: path, raw: raw, headers: forwardableHeaders(raw)}
@@ -149,6 +153,11 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, path string) {
 		}
 	}
 	c.body = body
+
+	if r.Method == http.MethodPost && provider == "cursor" && engines.IsServerConfigPath(path) {
+		c.forwardCursorServerConfig(baseURLForPath(provider, path))
+		return
+	}
 
 	// The body is parsed once. Python parses it twice to the same value: once
 	// for model_hint, and once for the optimize branch.
@@ -194,12 +203,6 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, path string) {
 	c.forward()
 }
 
-// refuseCursor answers a Cursor request with 501. The Cursor agent is not ported.
-func refuseCursor(w http.ResponseWriter, path string) {
-	logger.Warn(fmt.Sprintf("[PROXY] NOT PORTED: cursor request /%s refused with 501 (cursor is not in the Go server)", path))
-	writeDetail(w, http.StatusNotImplemented, "cursor proxying is NOT PORTED to the Go server yet; use the Python backend for Cursor")
-}
-
 // fail logs an unexpected error and answers 500, which is what Starlette does
 // for an exception the handler did not catch.
 func (c *proxyCall) fail(step string, err error) {
@@ -229,9 +232,8 @@ func (c *proxyCall) optimizeJSON(start time.Time) bool {
 		aggressive:     settingOn(settings, "aggressive_enabled"),
 	}
 
-	// Exact-hash cache only. Skip it for chatgpt (replay loops). Cursor never
-	// reaches this branch.
-	c.shouldCache = f.compression && c.provider != "chatgpt"
+	// Exact-hash cache only. Skip it for chatgpt and cursor (replay loops).
+	c.shouldCache = f.compression && c.provider != "chatgpt" && c.provider != "cursor"
 	if c.shouldCache {
 		// The key is over the ORIGINAL request, before any rewrite.
 		hash, err := engines.ComputeRequestHash(c.payload, c.provider, engines.CredentialFingerprint(c.credential))
@@ -398,7 +400,7 @@ func (c *proxyCall) record(model any, orig, opt, est int, latency int64, categor
 
 // forward sends the request upstream and relays the response.
 func (c *proxyCall) forward() {
-	base := baseURLFor(c.provider)
+	base := baseURLForPath(c.provider, c.path)
 	target := upstreamURL(base, c.path, c.r.URL.RawQuery)
 	logger.Info(fmt.Sprintf("[PROXY] %s /%s -> %s (%s)", c.r.Method, c.path, c.provider, base))
 

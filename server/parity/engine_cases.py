@@ -36,11 +36,14 @@ Run with the Gatekeep venv (needs tiktoken):
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import gzip
+import zlib
 import json
 import random
 import re
+import struct
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -1438,9 +1441,42 @@ def _b64s(b: bytes) -> str:
     return "b64:" + base64.b64encode(b).decode("ascii")
 
 
+def _frames_norm(body):
+    """Decoded-payload view of a Connect body, for the parity check only.
+
+    Gzip-flagged frames are gunzipped and the flag cleared on BOTH sides, so
+    the check compares the decoded message. Re-compressed bytes cannot match
+    (the gzip header holds the current time). Returns (bytes, has_gzip).
+    Anything that does not parse as frames is returned unchanged.
+    """
+    out = bytearray()
+    has_gzip = False
+    i = 0
+    while i < len(body):
+        if i + 5 > len(body):
+            return body, False
+        flags = body[i]
+        n = int.from_bytes(body[i + 1:i + 5], "big")
+        if i + 5 + n > len(body):
+            return body, False
+        payload = body[i + 5:i + 5 + n]
+        i += 5 + n
+        if flags & 0x01:
+            has_gzip = True
+            try:
+                payload = gzip.decompress(payload)
+                flags &= ~0x01
+            except (OSError, EOFError, ValueError, zlib.error):
+                pass
+        out += bytes([flags]) + len(payload).to_bytes(4, "big") + payload
+    return bytes(out), has_gzip
+
+
 def _w_connect(a):
     new, saved = wirecrush.crush_connect_body(_b64(a, "body_b64"), aggressive=a["aggressive"], seen=_seen(a))
-    return [_b64s(new), saved]
+    norm, has_gzip = _frames_norm(new)
+    _src, src_gzip = _frames_norm(_b64(a, "body_b64"))
+    return [_b64s(norm), None if (has_gzip or src_gzip) else saved]
 
 
 def _w_proto(a):
@@ -1451,12 +1487,15 @@ def _w_proto(a):
 def _w_wire(a):
     new, cats, saved = wirecrush.crush_wire_body(
         _b64(a, "body_b64"), path=a["path"], content_type=a["content_type"], aggressive=a["aggressive"])
-    return [_b64s(new), cats, saved]
+    norm, has_gzip = _frames_norm(new)
+    _src, src_gzip = _frames_norm(_b64(a, "body_b64"))
+    return [_b64s(norm), cats, None if (has_gzip or src_gzip) else saved]
 
 
 def _w_drain(a):
     rest, frames = wirecrush.drain_crush_frames(_b64(a, "body_b64"), aggressive=a["aggressive"], seen=_seen(a))
-    return [_b64s(rest), [_b64s(f) for f in frames]]
+    rest_n, _ = _frames_norm(rest)
+    return [_b64s(rest_n), [_b64s(_frames_norm(f)[0]) for f in frames]]
 
 
 def _w_json_body(a):
@@ -1551,16 +1590,782 @@ def _reset_e2() -> None:
 RESET.extend([_reset_ccr, _reset_e2])
 
 
+# --- decline classes: body_codec (zstd/gzip request bodies), connect_frames
+# (frame re-encode, compared at decoded-payload level), and the python fence
+# -------------------------------------------------------------------------
+
+from engines import body_codec, connect_frames  # noqa: E402
+
+import zstandard as _zstd  # noqa: E402
+
+
+def _body_codec_decode(a):
+    headers = a["headers"]
+    out, ok = body_codec.decode_request_body(_b64(a, "body_b64"), headers)
+    return [base64.b64encode(out).decode("ascii"), ok, headers]
+
+
+_TRANSFORMS = {
+    "identity": lambda b: b,
+    "upper": lambda b: b.upper(),
+    "append_x": lambda b: b + b"x",
+    "halve": lambda b: b[: len(b) // 2],
+}
+
+
+def _frame_view(body: bytes) -> list:
+    """Decoded-level view of a Connect body: changed frames are compared by
+    flags and decoded payload, never by gzip bytes (mtime and deflate output
+    are not reproducible across implementations)."""
+    frames = connect_frames.iter_frames(body)
+    if frames is None:
+        return ["raw", base64.b64encode(body).decode("ascii")]
+    view = []
+    for flags, payload in frames:
+        decoded = payload
+        if flags & 0x01:
+            try:
+                decoded = gzip.decompress(payload)
+            except Exception:  # noqa: BLE001 - not gzip after all: keep raw bytes
+                decoded = payload
+        view.append([flags, base64.b64encode(decoded).decode("ascii")])
+    return ["frames", view]
+
+
+def _connect_map(a):
+    fn = _TRANSFORMS[a["transform"]]
+    out, changed = connect_frames.map_frame_payloads(
+        _b64(a, "body_b64"), fn, skip_end_stream=a["skip_end_stream"]
+    )
+    return [changed, _frame_view(out)]
+
+
+DECL_ADAPTERS = {
+    "body_codec.decode_request_body": _body_codec_decode,
+    "connect_frames.map_frame_payloads": _connect_map,
+}
+ADAPTERS.update(DECL_ADAPTERS)
+
+
+# zstd / gzip body generation ------------------------------------------------
+
+_CE_VALUES = {
+    "zstd": ["zstd", "ZSTD", " zstd ", "zst", "Zst", "zstd, gzip", "zstd,", ",zstd", "zstd, zstd",
+             "", " ", "identity", "br", None, 0, 5, False],
+    "gzip": ["gzip", "x-gzip", "GZIP", " gzip", "gzip, zstd", "", "deflate", "zstd", None],
+    "none": ["", "identity", "br", "zstd", "gzip", None, " ", "zstd;q=1"],
+}
+
+
+def _zbytes(r: random.Random) -> bytes:
+    kind = r.random()
+    n = r.choice([0, 1, 5, 17, 100, 1000, 4096, 70000, 131072, 131073, 300000])
+    if kind < 0.25:
+        return r.randbytes(n)
+    if kind < 0.5:
+        return (b"abc" * (n // 3 + 1))[:n]
+    if kind < 0.65:
+        return b"\x00" * n
+    if kind < 0.85:
+        return "".join(r.choice(PROSE) + " " for _ in range(n // 6 + 1)).encode("utf-8")[:n]
+    return bytes(r.randrange(256) for _ in range(min(n, 2000)))
+
+
+def _zframe(r: random.Random) -> bytes:
+    payload = _zbytes(r)
+    level = r.choice([1, 3, 6, 19, 22])
+    checksum = r.random() < 0.3
+    if r.random() < 0.55:
+        return _zstd.ZstdCompressor(level=level, write_checksum=checksum).compress(payload)
+    c = _zstd.ZstdCompressor(level=level, write_content_size=False, write_checksum=checksum)
+    o = c.compressobj()
+    return o.compress(payload) + o.flush()
+
+
+def _zblock(last: int, typ: int, size: int, payload: bytes = b"") -> bytes:
+    h = (1 if last else 0) | (typ << 1) | (size << 3)
+    return bytes([h & 0xFF, (h >> 8) & 0xFF, (h >> 16) & 0xFF]) + payload
+
+
+def _zcrafted(r: random.Random) -> bytes:
+    """Frames built by hand: header variants, block types and sizes."""
+    m = b"\x28\xb5\x2f\xfd"
+    k = r.randrange(6)
+    n = r.randint(0, 9)
+    if k == 0:  # single segment, declared content size n, raw block of 5 bytes
+        return m + bytes([0x20, n]) + _zblock(1, 0, 5, b"abcde")
+    if k == 1:  # multi-segment with window descriptor, RLE block
+        wd = r.choice([0x58, 0x40, 0x48, 0xA0, 0xD8, 0x5F, 0x60])
+        return m + bytes([0x00, wd]) + _zblock(1, 1, r.choice([0, 3, 1000, 131072]), b"x")
+    if k == 2:  # two blocks, first not last, with a reserved block type sometimes
+        typ2 = r.choice([0, 0, 0, 2, 3])
+        return m + bytes([0x00, 0x58]) + _zblock(0, 0, 2, b"ab") + _zblock(r.choice([0, 1]), typ2, 2, b"cd")
+    if k == 3:  # checksum flag with a wrong or right checksum
+        return m + bytes([0x24, 3]) + _zblock(1, 0, 3, b"abc") + bytes(r.randrange(256) for _ in range(4))
+    if k == 4:  # reserved header bit, oversized raw block, skippable prefix
+        choice = r.randrange(3)
+        if choice == 0:
+            return m + bytes([0x08, 0x58]) + _zblock(1, 0, 3, b"abc")
+        if choice == 1:
+            return m + bytes([0x00, 0x58]) + _zblock(1, 0, 131073, b"q" * 131073)
+        return struct.pack("<II", 0x184D2A50, 3) + b"abc" + m + bytes([0x20, 3]) + _zblock(1, 0, 3, b"abc")
+    return m + bytes([0x00, 0x58])  # magic and header, no blocks
+
+
+def _mutate(r: random.Random, data: bytes) -> bytes:
+    if not data:
+        return data
+    op = r.randrange(5)
+    b = bytearray(data)
+    if op == 0:  # flip bytes
+        for _ in range(r.randint(1, 3)):
+            b[r.randrange(len(b))] = r.randrange(256)
+        return bytes(b)
+    if op == 1:  # truncate
+        return bytes(b[: r.randrange(len(b))])
+    if op == 2:  # trailing bytes
+        return bytes(b) + r.choice([b"\x00", b"\x00\x00\x00\x00", b"junk", b"\x28\xb5\x2f\xfd"])
+    if op == 3:  # corrupt the header area
+        b[min(4, len(b) - 1)] = r.randrange(256)
+        return bytes(b)
+    return bytes(b[: r.randint(0, 6)])
+
+
+def _gzip_body(r: random.Random) -> bytes:
+    payload = _zbytes(r)
+    g = gzip.compress(payload, mtime=0)
+    k = r.randrange(5)
+    if k == 0:
+        return g
+    if k == 1:
+        return g + gzip.compress(payload[:7], mtime=0) + b"\x00" * r.randint(0, 3)
+    if k == 2:
+        return _mutate(r, g)
+    if k == 3:
+        return g + b"\x00\x00"
+    return b"\x1f\x8b" + r.randbytes(r.randint(0, 20))
+
+
+def _body_codec_case(r: random.Random) -> list:
+    k = r.random()
+    if k < 0.45:
+        body = _zframe(r)
+        if r.random() < 0.25:
+            body = _mutate(r, body)
+        elif r.random() < 0.2:
+            body = _zframe(r) + _zframe(r)  # two frames: only the first is decoded
+        elif r.random() < 0.1:
+            body = struct.pack("<II", 0x184D2A50, 3) + b"abc" + body
+        codec_hint = "zstd"
+    elif k < 0.6:
+        body = _zcrafted(r)
+        codec_hint = "zstd"
+    elif k < 0.8:
+        body = _gzip_body(r)
+        codec_hint = "gzip"
+    else:
+        body = r.randbytes(r.randint(0, 40))
+        if r.random() < 0.5:
+            body = b"\x28\xb5\x2f\xfd" + body
+        codec_hint = "none"
+    headers = {"user-agent": "t", "x-trace": "1"}
+    if r.random() < 0.9:
+        key = r.choice(["content-encoding", "Content-Encoding", "CONTENT-ENCODING"])
+        headers[key] = r.choice(_CE_VALUES[codec_hint])
+    if r.random() < 0.08:
+        headers["content-encoding"] = r.choice(["zstd", "gzip"])
+        headers["Content-Encoding"] = r.choice(["zstd", "gzip", "br"])
+    return [{"fn": "body_codec.decode_request_body",
+             "args": {"body_b64": base64.b64encode(body).decode("ascii"), "headers": headers}}]
+
+
+def _connect_case(r: random.Random) -> list:
+    frames = []
+    for _ in range(r.randint(0, 4)):
+        flags = r.choice([0, 0, 1, 1, 2, 3, 0x80, 0x81])
+        payload = _zbytes(r)[:r.choice([0, 9, 200, 3000])]
+        if flags & 0x01 and r.random() < 0.9:
+            payload = gzip.compress(payload, mtime=0)
+        frames.append((flags, payload))
+    body = connect_frames.encode_frames(frames) if frames else b""
+    if r.random() < 0.15:
+        body = _mutate(r, body) if body else b"\x00\x00"
+    if r.random() < 0.1:
+        body = r.randbytes(r.randint(0, 12))
+    return [{"fn": "connect_frames.map_frame_payloads",
+             "args": {"body_b64": base64.b64encode(body).decode("ascii"),
+                      "transform": r.choice(list(_TRANSFORMS)),
+                      "skip_end_stream": r.random() < 0.8}}]
+
+
+def _decl_case(r: random.Random) -> list:
+    k = r.random()
+    if k < 0.3:
+        return _body_codec_case(r)
+    if k < 0.4:
+        return _connect_case(r)
+    if k < 0.6:
+        return _name_case(r)
+    return _pa_case(r)
+
+
+
+# --- python fence: _distill_python_signatures (ast.unparse signature stubs) --
+
+_PA_PUBLIC = ["foo", "Bar", "get_x", "value", "data", "x1", "cls", "naïve", "café", "Ωmega",
+              "日本", "ǅx", "ℌello", "ﬁle", "ｆｏｏ", "ＡＢＣ", "ﬀ", "ᴬ", "µ", "ŉ", "ẞ", "ſ",
+              "ǈ", "ı", "ⅻ", "℘", "ＧＯ", "ﬂoat", "ｉｆ", "Ǆ", "ϴ", "__init__", "__call__",
+              "__x__", "ｘ", "ℕ", "Ⅸ", "ᵃ", "ꞩ", "ℓ", "ʰ"]
+_PA_PRIVATE = ["_priv", "__mangled", "＿under", "_", "__", "_x_", "___"]
+_PA_BAD = ["x²", "1x", "a-b"]  # invalid identifiers: must reject
+
+_PA_NAMES = ["LATIN SMALL LETTER E WITH ACUTE", "GREEK SMALL LETTER ALPHA", "LINE FEED", "NULL",
+             "SNOWMAN", "EM DASH", "CJK UNIFIED IDEOGRAPH-4E00", "HANGUL SYLLABLE GA",
+             "latin small letter a", "LATIN CAPITAL LETTER SHARP S", "NO-BREAK SPACE",
+             "BYTE ORDER MARK", "ZERO WIDTH SPACE", "CHARACTER TABULATION", "SPACE",
+             "LATIN SMALL LETTER A WITH MACRON AND GRAVE", "NOT A REAL NAME", "COMBINING ACUTE ACCENT",
+             "DIGIT ZERO", "FULLWIDTH LATIN SMALL LETTER A", "BLACK HEART SUIT", "LATIN SMALL LIGATURE FI",
+             "EURO SIGN", "U+0041", "LATIN CAPITAL LETTER A WITH GRAVE", "HIRAGANA LETTER A",
+             "CJK COMPATIBILITY IDEOGRAPH-F900", "TANGUT IDEOGRAPH-17000", "LINEAR B SYLLABLE B008 A",
+             "SYRIAC LETTER ALAPH", "MUSICAL SYMBOL G CLEF", "EMOJI"]
+
+_PA_STR_BODY = ["abc", "x y", "tab\\t", "nl\\n", "q\\'", "dq\\\"", "\\\\", "\\x41", "\\u00e9", "\\U0001F600",
+                "\\101", "\\q", "é", "日本", "\\N{LATIN SMALL LETTER E WITH ACUTE}", "\\N{LINE FEED}",
+                "\\N{NULL}", "\\N{SNOWMAN}", "\\N{EM DASH}", "\\N{BYTE ORDER MARK}", "\\N{NOT A REAL NAME}",
+                "\\N{latin small letter a}", "\\N{CJK UNIFIED IDEOGRAPH-4E00}", "\\N{HANGUL SYLLABLE GA}",
+                "\\\n", "\u0085", "\u00a0", "\u200b", "\u2028", "\x7f", "\x01", "{{x}}", "a{{", "\\{", "\\\\N{x}"]
+
+
+def _pa_ident(r: random.Random) -> str:
+    k = r.random()
+    if k < 0.6:
+        return r.choice(_PA_PUBLIC)
+    if k < 0.9:
+        return r.choice(_PA_PRIVATE)
+    if k < 0.97:
+        return r.choice(_PA_PUBLIC) + str(r.randint(0, 9))
+    return r.choice(_PA_BAD)
+
+
+def _pa_string(r: random.Random) -> str:
+    prefix = r.choice(["", "", "", "r", "b", "rb", "u", "f", "F", "Rb", "BR", "fr"])
+    body = "".join(r.choice(_PA_STR_BODY) for _ in range(r.randint(0, 3)))
+    if "b" in prefix.lower():
+        body = "".join(c for c in body if ord(c) < 128 and c not in "\\\n\x00") if r.random() < 0.7 else body
+    if "f" in prefix.lower() and r.random() < 0.5:
+        body += "{" + r.choice(["x", "y!r", "a:>3", "z=", "w[0]"]) + "}"
+    q = r.choice(["'", '"', "'''", '"""'])
+    if len(q) == 1 and ("\n" in body):
+        body = body.replace("\n", "")
+    return prefix + q + body.replace(q[0], "\\" + q[0]) + q if len(q) == 1 else prefix + q + body + q
+
+
+_PA_NUMS = ["0", "1", "42", "0x1F", "0o17", "0b101", "1_000", "1.5", "1e10", "1.0e-5", "3j", "1_0.5_0j",
+            "1e400", "0.1", "123456789012345678901234567890", "2.5j", ".5", "5.", "0xFFFF_FFFF",
+            "1E+3", "0.0", "-0.0", "1e-400", "10j", "1.7976931348623157e308"]
+
+
+def _pa_expr(r: random.Random, d: int = 0) -> str:
+    if d > 2 or r.random() < 0.35:
+        k = r.random()
+        if k < 0.3:
+            return _pa_ident(r)
+        if k < 0.55:
+            return r.choice(_PA_NUMS)
+        if k < 0.8:
+            return _pa_string(r)
+        return r.choice(["None", "True", "False", "..."])
+    k = r.randrange(14)
+    if k == 0:
+        return f"{_pa_expr(r, d+1)}.{_pa_ident(r)}"
+    if k == 1:
+        return f"{_pa_expr(r, d+1)}({', '.join(_pa_arg(r, d+1) for _ in range(r.randint(0, 3)))})"
+    if k == 2:
+        return f"{_pa_expr(r, d+1)}[{_pa_expr(r, d+1)}{r.choice(['', ', ' + _pa_expr(r, d+1), ':', '::2', '1:2'])}]"
+    if k == 3:
+        return f"({_pa_expr(r, d+1)} {r.choice(['+', '-', '*', '**', '//', '@', '<<', '|', '&', '^', '%'])} {_pa_expr(r, d+1)})"
+    if k == 4:
+        return f"{r.choice(['-', '+', '~', 'not '])}{_pa_expr(r, d+1)}"
+    if k == 5:
+        return f"({_pa_expr(r, d+1)} {r.choice(['<', '==', 'is not', 'in', '!=', '>='])} {_pa_expr(r, d+1)})"
+    if k == 6:
+        return f"({_pa_expr(r, d+1)} {r.choice(['and', 'or'])} {_pa_expr(r, d+1)})"
+    if k == 7:
+        return f"({_pa_expr(r, d+1)} if {_pa_expr(r, d+1)} else {_pa_expr(r, d+1)})"
+    if k == 8:
+        return f"[{', '.join(_pa_expr(r, d+1) for _ in range(r.randint(0, 3)))}]"
+    if k == 9:
+        return f"({', '.join(_pa_expr(r, d+1) for _ in range(r.randint(1, 3)))}{',' if r.random() < 0.3 else ''})"
+    if k == 10:
+        return "{" + ", ".join(f"{_pa_expr(r, d+1)}: {_pa_expr(r, d+1)}" for _ in range(r.randint(0, 2))) + "}"
+    if k == 11:
+        return f"[{_pa_expr(r, d+1)} for {_pa_ident(r)} in {_pa_expr(r, d+1)} if {_pa_expr(r, d+1)}]"
+    if k == 12:
+        return f"(lambda {_pa_ident(r)}, *{_pa_ident(r)}: {_pa_expr(r, d+1)})"
+    return f"({_pa_ident(r)} := {_pa_expr(r, d+1)})"
+
+
+def _pa_arg(r: random.Random, d: int) -> str:
+    k = r.random()
+    if k < 0.1:
+        return "*" + _pa_expr(r, d)
+    if k < 0.2:
+        return "**" + _pa_expr(r, d)
+    if k < 0.3:
+        return f"{_pa_ident(r)}={_pa_expr(r, d)}"
+    return _pa_expr(r, d)
+
+
+def _pa_params(r: random.Random) -> str:
+    parts = []
+    n_pos = r.randint(0, 3)
+    for _ in range(n_pos):
+        ann = f": {_pa_expr(r, 1)}" if r.random() < 0.4 else ""
+        dflt = f" = {_pa_expr(r, 1)}" if r.random() < 0.3 else ""
+        parts.append(f"{_pa_ident(r)}{ann}{dflt}")
+    if parts and r.random() < 0.25:
+        parts.insert(r.randint(0, len(parts)), "/")
+    if r.random() < 0.3:
+        star_ann = f": *{_pa_ident(r)}" if r.random() < 0.15 else (f": {_pa_expr(r, 1)}" if r.random() < 0.5 else "")
+        parts.append("*" + _pa_ident(r) + star_ann)
+    elif r.random() < 0.2:
+        parts.append("*")
+    for _ in range(r.randint(0, 2)):
+        ann = f": {_pa_expr(r, 1)}" if r.random() < 0.4 else ""
+        parts.append(f"{_pa_ident(r)}{ann}{'' if r.random() < 0.5 else ' = ' + _pa_expr(r, 1)}")
+    if r.random() < 0.25:
+        parts.append("**" + _pa_ident(r) + (f": {_pa_expr(r, 1)}" if r.random() < 0.3 else ""))
+    return ", ".join(parts)
+
+
+def _pa_tparams(r: random.Random) -> str:
+    if r.random() < 0.8:
+        return ""
+    items = []
+    for _ in range(r.randint(1, 3)):
+        k = r.random()
+        if k < 0.6:
+            items.append(_pa_ident(r) + (f": {_pa_expr(r, 2)}" if r.random() < 0.4 else ""))
+        elif k < 0.8:
+            items.append("*" + _pa_ident(r))
+        else:
+            items.append("**" + _pa_ident(r))
+    return "[" + ", ".join(items) + "]"
+
+
+def _pa_body(r: random.Random, ind: str) -> str:
+    lines = []
+    if r.random() < 0.5:
+        lines.append(ind + "    " + _pa_string(r))
+    for _ in range(r.randint(0, 2)):
+        k = r.random()
+        if k < 0.4:
+            lines.append(ind + "    " + _pa_ident(r) + " = " + _pa_expr(r, 1))
+        elif k < 0.6:
+            lines.append(ind + "    " + "return " + _pa_expr(r, 1))
+        elif k < 0.7:
+            lines.append(ind + "    " + "def " + _pa_ident(r) + "():\n" + ind + "        pass")
+        else:
+            lines.append(ind + "    " + "if " + _pa_expr(r, 1) + ":\n" + ind + "        pass")
+    if not lines:
+        lines.append(ind + "    pass")
+    return "\n".join(lines)
+
+
+def _pa_func(r: random.Random, ind: str, in_class: bool) -> str:
+    out = []
+    for _ in range(r.choice([0, 0, 1, 1, 2])):
+        out.append(ind + "@" + r.choice(["dec", "property", "a.b(1)", "staticmethod", "x[0]", "f(*a)"]))
+    kw = "async def " if r.random() < 0.2 else "def "
+    name = _pa_ident(r)
+    ret = f" -> {_pa_expr(r, 1)}" if r.random() < 0.4 else ""
+    out.append(f"{ind}{kw}{name}{_pa_tparams(r)}({_pa_params(r)}){ret}:")
+    out.append(_pa_body(r, ind))
+    return "\n".join(out)
+
+
+def _pa_class(r: random.Random, ind: str) -> str:
+    decos = []
+    for _ in range(r.choice([0, 0, 1])):
+        decos.append(ind + "@" + r.choice(["dataclass", "a.b", "f(1)"]))
+    bases = []
+    if r.random() < 0.5:
+        bases.append(_pa_expr(r, 1))
+    if r.random() < 0.2:
+        bases.append("metaclass=" + _pa_expr(r, 2))
+    base = f"({', '.join(bases)})" if bases else ""
+    head = f"{ind}class {_pa_ident(r)}{_pa_tparams(r)}{base}:"
+    body = []
+    if r.random() < 0.4:
+        body.append(ind + "    " + _pa_string(r))
+    for _ in range(r.randint(0, 3)):
+        k = r.random()
+        if k < 0.25:
+            body.append(ind + "    " + _pa_ident(r) + ": " + _pa_expr(r, 1))
+        elif k < 0.45:
+            body.append(ind + "    " + _pa_ident(r) + " = " + _pa_expr(r, 1))
+        elif k < 0.85:
+            body.append(_pa_func(r, ind + "    ", True))
+        else:
+            body.append(ind + "    class " + _pa_ident(r) + ":\n" + ind + "        pass")
+    if not body:
+        body.append(ind + "    pass")
+    return "\n".join(decos + [head] + body)
+
+
+def _pa_module(r: random.Random) -> str:
+    parts = []
+    for _ in range(r.randint(1, 4)):
+        k = r.random()
+        if k < 0.35:
+            parts.append(_pa_func(r, "", False))
+        elif k < 0.6:
+            parts.append(_pa_class(r, ""))
+        elif k < 0.7:
+            parts.append(f"{_pa_ident(r)} = {_pa_expr(r, 1)}")
+        elif k < 0.75:
+            parts.append("import os, sys as s")
+        elif k < 0.8:
+            parts.append("if x:\n    def f(): pass")
+        elif k < 0.85:
+            parts.append("# comment\n" + "x = 1  # the comment")
+        else:
+            parts.append(_pa_string(r))
+    sep = r.choice(["\n\n", "\n", "\n\n\n", "\r\n\r\n", "\n\t\n"])
+    src = sep.join(parts) + "\n"
+    if r.random() < 0.15:
+        pos = r.randrange(len(src) + 1)
+        src = src[:pos] + r.choice(["(", ")", ":", "\"", "'", "\\", "\t", "@", "é", "\x00", "'''", "\n  "]) + src[pos:]
+    return src
+
+
+def _pa_deep(r: random.Random) -> str:
+    """Deep expression nesting in a default value: the depth limit of
+    engines/pyast.go (pyastChainLimit) is decided by these shapes."""
+    n = r.choice([3, 20, 60, 99, 100, 101, 120, 160, 164, 196, 199, 250, 300, 420])
+    k = r.randrange(12)
+    if k == 0:
+        e = "+".join(["1"] * n)
+    elif k == 1:
+        e = "-" * n + "1"
+    elif k == 2:
+        e = "(" * min(n, 199) + "1" + ")" * min(n, 199)
+    elif k == 3:
+        e = " if x else ".join(["1"] * n)
+    elif k == 4:
+        e = "x" + ".y" * n
+    elif k == 5:
+        e = "not " * n + "1"
+    elif k == 6:
+        e = "**".join(["1"] * n)
+    elif k == 7:
+        e = "(lambda: " * min(n, 199) + "1" + ")" * min(n, 199)
+    elif k == 8:
+        e = "[" * min(n, 199) + "1" + "]" * min(n, 199)
+    elif k == 9:
+        e = "{1:" * min(n, 199) + "1" + "}" * min(n, 199)
+    elif k == 10:
+        e = "(1," * min(n, 199) + "1" + ")" * min(n, 199)
+    else:
+        e = "g(" * min(n, 199) + "1" + ")" * min(n, 199)
+    head = r.choice(["def f(a=", "class C(B=", "def g(x: int = "])
+    tail = "):\n    pass\n" if head.startswith("def") else "):\n    pass\n"
+    return head + e + tail
+
+
+def _pa_case(r: random.Random) -> list:
+    if r.random() < 0.3:
+        return _pa_fence_case(r)
+    code = _pa_deep(r) if r.random() < 0.2 else _pa_module(r)
+    return [{"fn": "pyast.distill_python_signatures", "args": {"code": code}}]
+
+
+def _pa_fence_case(r: random.Random) -> list:
+    """A python fence inside prose: the _prune_middle_content branch that
+    replaces the block with its signature stub (or falls through)."""
+    k = r.random()
+    if k < 0.1:
+        code = _pa_deep(r)
+    elif k < 0.6:
+        code = _pa_func(r, "", False) if r.random() < 0.6 else _pa_class(r, "")
+    else:
+        code = _pa_module(r)
+    fence = r.choice(["```python", "```python", "```PYTHON", "``` python", "```py"])
+    prose = r.choice(["Intro text.\n", "", "x\n\n"])
+    text = prose + fence + "\n" + code + "\n```\n" + r.choice(["tail", "", "\n"])
+    if r.random() < 0.1:
+        text = text + "\n" + "\n".join(["log line %d" % i for i in range(r.randint(1, 60))])
+    return [{"fn": "optimizer._prune_middle_content",
+             "args": {"text": text, "log_truncation_enabled": r.random() < 0.5}}]
+
+
+def _pyast_distill(a):
+    return optimizer._distill_python_signatures(a["code"])
+
+
+ADAPTERS["pyast.distill_python_signatures"] = _pyast_distill
+
+
+# --- cursor rewrite: GetServerConfig agent URLs (engines/cursor_rewrite.py) --
+#
+# The rewrite keeps global state (the cached agent endpoint). Each case starts
+# from a cleared cache, so every case is independent of the others.
+
+from engines import cursor_rewrite  # noqa: E402
+
+_CUR_HOSTS = [
+    "agentn.global.api5.cursor.sh", "agent.cursor.sh", "agent-gcpp.cursor.sh",
+    "agent-x.cursor.sh", "AGENT.CURSOR.SH", "agent-x%.cursor.sh", "agent%.cursor.sh",
+    "agentx.cursor.sh", "agentn.cursor.sh.evil.example", "api2.cursor.sh",
+    "api.cursor.sh", "repo42.cursor.sh", "staging.cursor.sh", "dev-staging.cursor.sh",
+    "agen\tt.cursor.sh", "agent.cursor.sh\n", "example.com", "[::1]", "[agent.cursor.sh",
+    "agent.cursor.sh]", "", "agent.cursor.sh%41", "x.agent.cursor.sh", "agent-.cursor.sh",
+]
+_CUR_SCHEMES = ["https://"] * 12 + ["http://", "HTTPS://", "https:/", " https://", "https:\t//"]
+_CUR_USERS = ["", "", "", "user@", "u:p@", "x@y@"]
+_CUR_PORTS = ["", "", "", ":443", ":8443", ":abc", ":"]
+_CUR_TAILS = ["", "", "/", "/agent.v1.AgentService/Run", "/x/agent.v1.AgentService/Run/",
+              "?a=1", "#frag", "/p?q=1#f"]
+_CUR_GATEKEEP = ["http://gk.test:9478", "http://127.0.0.1:9478/", "https://gk.example.test",
+                 "http://[::1]:9478//", "", "http://x\t", "http://gk.test:9478///"]
+_CUR_PATHS = [
+    "aiserver.v1.ServerConfigService/GetServerConfig", "/aiserver.v1.ServerConfigService/GetServerConfig?x=1",
+    "aiserver.v1.AiService/StreamChat", "x/getserverconfig", "ServerConfigService",
+    "agent.v1.AgentService/Run", "", "/",
+]
+
+
+def _reset_cursor() -> None:
+    cursor_rewrite._agent_upstream = None
+
+
+RESET.append(_reset_cursor)
+
+
+def _cur_url(r: random.Random) -> str:
+    if r.random() < 0.35:
+        return "https://agentn.global.api5.cursor.sh"
+    return (r.choice(_CUR_SCHEMES) + r.choice(_CUR_USERS) + r.choice(_CUR_HOSTS)
+            + r.choice(_CUR_PORTS) + r.choice(_CUR_TAILS))
+
+
+def _cur_garbage(r: random.Random, n: int) -> bytes:
+    return bytes(r.randint(0, 255) for _ in range(n))
+
+
+def _cur_msg(r: random.Random, depth: int) -> bytes:
+    """A protobuf message mixing agent URLs, http2_config, nested messages and noise."""
+    parts: list = []
+    for _ in range(r.randint(1, 5)):
+        k = r.random()
+        fn = r.choice([1, 1, 2, 3, 4, 5, 9, 12])
+        if k < 0.30:
+            parts.append(_pld(fn, _cur_url(r).encode("utf-8")))
+        elif k < 0.40:
+            parts.append(_pvf(7, r.choice([0, 1, 2, 3, 3, 4, 300])))
+        elif k < 0.50 and depth < 3:
+            parts.append(_pld(fn, _cur_msg(r, depth + 1)))
+        elif k < 0.62:
+            parts.append(_pld(fn, _ptext(r)))
+        elif k < 0.72:
+            parts.append(_pvf(fn, r.randint(0, 1 << 20)))
+        elif k < 0.78:
+            parts.append(_pvi((fn << 3) | 1) + _cur_garbage(r, 8))
+        elif k < 0.84:
+            parts.append(_pvi((fn << 3) | 5) + _cur_garbage(r, 4))
+        elif k < 0.92:
+            parts.append(_pld(fn, _cur_garbage(r, r.randint(0, 12))))
+        else:
+            parts.append(_cur_garbage(r, r.randint(1, 6)))
+    return b"".join(parts)
+
+
+def _cur_plain(r: random.Random) -> bytes:
+    """Bytes that never parse as a message (a wire-type-3 key first), so a gzip
+    frame of them is never rewritten. A rewritten gzip frame would be compressed
+    again with the current time as mtime, which no implementation reproduces."""
+    return b"\x0b" + bytes(r.choice(b"abcdefghij0123456789 ") for _ in range(r.randint(0, 40)))
+
+
+def _cur_frame(flags: int, payload: bytes) -> bytes:
+    return bytes([flags]) + len(payload).to_bytes(4, "big") + payload
+
+
+def _cur_body(r: random.Random) -> bytes:
+    """A Connect body: framed, unframed, truncated, or with odd gzip-flagged frames."""
+    k = r.random()
+    if k < 0.12:
+        return _cur_msg(r, 0)  # not framed at all
+    frames: list = []
+    for _ in range(r.randint(1, 4)):
+        j = r.random()
+        if j < 0.55:
+            frames.append(_cur_frame(0, _cur_msg(r, 0)))
+        elif j < 0.65:
+            frames.append(_cur_frame(2, b'{"error":{"code":"unavailable","message":"x"}}'))
+        elif j < 0.75:
+            frames.append(_cur_frame(1, gzip.compress(_cur_plain(r), mtime=0)))  # gzip, unchanged
+        elif j < 0.83:
+            frames.append(_cur_frame(1, _cur_msg(r, 0)))  # flagged but not gzip: OSError path
+        elif j < 0.88:
+            frames.append(_cur_frame(1, b"\x1f\x8b" + _cur_garbage(r, 12)))  # bad gzip header
+        elif j < 0.92:
+            frames.append(_cur_frame(1, gzip.compress(_cur_plain(r), mtime=0)[:-6]))  # truncated: EOF
+        else:
+            frames.append(_cur_frame(0, _cur_garbage(r, r.randint(0, 9))))
+    body = b"".join(frames)
+    if r.random() < 0.10 and body:
+        body = body[: r.randint(1, len(body))]  # cut mid-frame
+    return body
+
+
+def _cur_step(r: random.Random) -> dict:
+    gk = r.choice(_CUR_GATEKEEP)
+    k = r.random()
+    if k < 0.18:
+        return {"fn": "cursor_rewrite.rewrite_protobuf_agent_urls",
+                "args": {"body_b64": _b64_arg(_cur_msg(r, 0)), "gatekeep": gk}}
+    if k < 0.36:
+        return {"fn": "cursor_rewrite.rewrite_connect_response",
+                "args": {"body_b64": _b64_arg(_cur_body(r)), "gatekeep": gk}}
+    if k < 0.70:
+        return {"fn": "cursor_rewrite.maybe_rewrite_server_config",
+                "args": {"path": r.choice(_CUR_PATHS), "body_b64": _b64_arg(_cur_body(r)), "gatekeep": gk}}
+    if k < 0.78:
+        return {"fn": "cursor_rewrite.is_server_config_path", "args": {"path": r.choice(_CUR_PATHS)}}
+    if k < 0.88:
+        return {"fn": "cursor_rewrite.is_agent_run_url", "args": {"url": _cur_url(r)}}
+    if k < 0.94:
+        return {"fn": "cursor_rewrite.remember_agent_upstream", "args": {"url": _cur_url(r)}}
+    return {"fn": "cursor_rewrite.get_agent_upstream", "args": {}}
+
+
+def _cursor_case(r: random.Random) -> list:
+    if r.random() < 0.6:
+        return [_cur_step(r)]
+    return [_cur_step(r) for _ in range(r.randint(2, 4))]
+
+
+def _cur_rewrite_pb(a):
+    return cursor_rewrite.rewrite_protobuf_agent_urls(_b64(a, "body_b64"), a["gatekeep"])
+
+
+# Once any frame changes, map_frame_payloads re-compresses every gzip-flagged
+# frame with the current time as mtime. No implementation reproduces those bytes,
+# so Connect bodies are compared after gzip is stripped from the frames: the
+# flags, the decoded payloads and the framing all still match exactly.
+from engines import connect_frames as _cf  # noqa: E402
+
+
+def _cur_rewrite_connect(a):
+    out = cursor_rewrite.rewrite_connect_response(_b64(a, "body_b64"), a["gatekeep"])
+    return _cf.decompress_connect_body(out)
+
+
+def _cur_maybe(a):
+    new, rw = cursor_rewrite.maybe_rewrite_server_config(a["path"], _b64(a, "body_b64"), a["gatekeep"])
+    return [_b64s(_cf.decompress_connect_body(new)), rw]
+
+
+def _cur_remember(a):
+    cursor_rewrite._remember_agent_upstream(a["url"])
+    return cursor_rewrite.get_agent_upstream()
+
+
+ADAPTERS.update({
+    "cursor_rewrite.rewrite_protobuf_agent_urls": _cur_rewrite_pb,
+    "cursor_rewrite.rewrite_connect_response": _cur_rewrite_connect,
+    "cursor_rewrite.maybe_rewrite_server_config": _cur_maybe,
+    "cursor_rewrite.is_server_config_path": lambda a: cursor_rewrite.is_server_config_path(a["path"]),
+    "cursor_rewrite.is_agent_run_url": lambda a: cursor_rewrite._is_agent_run_url(a["url"]),
+    "cursor_rewrite.remember_agent_upstream": _cur_remember,
+    "cursor_rewrite.get_agent_upstream": lambda a: cursor_rewrite.get_agent_upstream(),
+})
+
+
+# --- \N{name} resolution, through CPython's own literal parser -----------
+
+_NAMES_GZ = Path(__file__).resolve().parents[1] / "engines" / "pyast_names.txt.gz"
+_TABLE_NAMES: list[str] = []
+_TABLE_CJK: list[tuple[int, int]] = []
+
+
+def _load_table_names() -> None:
+    if _TABLE_NAMES:
+        return
+    text = gzip.decompress(_NAMES_GZ.read_bytes()).decode("utf-8")
+    for line in text.splitlines():
+        kind, *rest = line.split("\t")
+        if kind == "N":
+            _TABLE_NAMES.append(rest[1])
+        elif kind == "R":
+            _TABLE_CJK.append((int(rest[0], 16), int(rest[1], 16)))
+
+
+def _literal_name(a):
+    """The code point CPython gives "\\N{name}" in a non-raw str literal."""
+    value = ast.parse('"\\N{' + a["name"] + '}"', mode="eval").body.value
+    if len(value) != 1:
+        raise ValueError("not a single code point")
+    return ord(value)
+
+
+ADAPTERS["pyast.literal_name"] = _literal_name
+
+_NAME_BOGUS = ["NOT A REAL NAME", "LATIN CAPITAL LETTER A WITH MACRON AND GRAVE", "LINE FEED (LF)",
+               "U+0041", "", " ", "SPACE ", " SPACE", "LATIN  SMALL LETTER A", "HANGUL SYLLABLE",
+               "HANGUL SYLLABLE GGAGX", "HANGUL SYLLABLE GA ", "hangul syllable ga", "Hangul Syllable GA",
+               "CJK UNIFIED IDEOGRAPH-", "CJK UNIFIED IDEOGRAPH-4E0", "CJK UNIFIED IDEOGRAPH-4e00",
+               "cjk unified ideograph-4E00", "CJK UNIFIED IDEOGRAPH-0x4E00", "CJK UNIFIED IDEOGRAPH-+4E00",
+               "CJK UNIFIED IDEOGRAPH-04E00", "CJK UNIFIED IDEOGRAPH-A000", "CJK UNIFIED IDEOGRAPH-2EBE1",
+               "CJK COMPATIBILITY IDEOGRAPH-F8FF", "TANGUT IDEOGRAPH-17000", "TANGUT COMPONENT-001",
+               "KHITAN SMALL SCRIPT CHARACTER-18B00", "NUSHU CHARACTER-1B170", "LINE FEED", "null",
+               "LATIN SMALL LIGATURE FI", "EMOJI", "BLACK HEART SUIT ", "E", "SNOWMAN\x00", "SNOW\nMAN",
+               "LATIN SMALL LETTER E WITH ACUTEé", "ÉCOLE", "A}"]
+
+
+def _name_variant(r: random.Random) -> str:
+    _load_table_names()
+    k = r.random()
+    if k < 0.55:
+        return r.choice(_TABLE_NAMES)
+    if k < 0.65:
+        return r.choice(_TABLE_NAMES).lower()
+    if k < 0.7:
+        return r.choice(_TABLE_NAMES).title()
+    if k < 0.75:
+        name = r.choice(_TABLE_NAMES)
+        pos = r.randrange(len(name) + 1)
+        return name[:pos] + r.choice([" ", "-", "X", ""]) + name[pos + 1:]
+    if k < 0.8:
+        lo, hi = r.choice(_TABLE_CJK)
+        cp = r.randint(lo - 2, hi + 2)
+        return "CJK UNIFIED IDEOGRAPH-" + format(cp, r.choice(["04X", "05X", "X", "x"]))
+    if k < 0.85:
+        return "HANGUL SYLLABLE " + r.choice(["GA", "GGAG", "HIH", "KKAK", "SSAN"]) + r.choice(["", "", "X"])
+    return r.choice(_NAME_BOGUS)
+
+
+def _name_case(r: random.Random) -> list:
+    return [{"fn": "pyast.literal_name", "args": {"name": _name_variant(r)}}]
+
+
+
 def _case(r: random.Random, case_id: int, huge: bool) -> dict:
     """Build one case: a list of steps, the expected results, and the errors."""
     if huge:
         steps = [{"fn": "optimizer.apply_file_delta_tracking",
                   "args": {"payload": {"messages": [{"role": "user", "content": "x"}]},
                            "session_key": f"s{i}"}} for i in range(205)]
+    elif case_id % 10 < 7:
+        # 70% of the cases are cursor rewrite cases: 2100 of 3000.
+        steps = _cursor_case(r)
     elif r.random() < 0.08:
         steps = _loop_session_steps(r, r.choice(["s1", "s2"]))
     elif r.random() < 0.12:
         steps = _file_sequence(r, f"sess{r.randint(0, 2)}", r.randint(2, 4))
+    elif r.random() < 0.10:
+        steps = _decl_case(r)
     elif r.random() < 0.45:
         steps = _e2_case(r)
     else:

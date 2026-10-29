@@ -3,6 +3,7 @@
 package engines
 
 import (
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -270,17 +271,23 @@ func TestNewestToolResultHeadTailCap(t *testing.T) {
 	}
 }
 
-func TestPruneHistoryPythonFenceIsUnsupported(t *testing.T) {
-	// A ```python block in pruned history needs Python's ast.unparse, which
-	// this port does not have. The port must decline, not guess.
-	msgs := []any{}
-	for i := 0; i < 9; i++ {
-		msgs = append(msgs, objectOf("role", "user", "content", "text"))
+func TestPruneMiddlePythonFenceStub(t *testing.T) {
+	// Expected value from CPython 3.12: _prune_middle_content on this block.
+	in := "```python\ndef f():\n    pass\n```"
+	want := "```python\ndef f():\n    ...\n```"
+	got, err := pruneMiddleContent(in, true)
+	if err != nil || got != want {
+		t.Fatalf("pruneMiddleContent = %q, %v; want %q", got, err, want)
 	}
-	msgs[4] = objectOf("role", "assistant", "content", "```python\ndef f():\n    pass\n```")
-	_, err := PruneHistory(msgs, true, true)
+}
+
+func TestPruneMiddlePythonFenceDeclinesDeepNesting(t *testing.T) {
+	// 200 nested dict displays: CPython's ast.unparse fails on them and the
+	// distiller would return the code unchanged, so the port declines.
+	code := "def f(a=" + strings.Repeat("{1:", 150) + "1" + strings.Repeat("}", 150) + "):\n    pass"
+	_, err := pruneMiddleContent("```python\n"+code+"\n```", true)
 	if !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("PruneHistory error = %v, want ErrUnsupported", err)
+		t.Fatalf("pruneMiddleContent error = %v, want ErrUnsupported", err)
 	}
 }
 
@@ -353,10 +360,26 @@ func TestDecodeRequestBodyGzip(t *testing.T) {
 	}
 }
 
-func TestDecodeRequestBodyZstdIsUnsupported(t *testing.T) {
-	body := append([]byte{0x28, 0xb5, 0x2f, 0xfd}, []byte("payload")...)
-	_, _, err := DecodeRequestBody(body, pyjson.NewObject())
-	if !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("zstd body error = %v, want ErrUnsupported", err)
+func TestDecodeRequestBodyZstd(t *testing.T) {
+	// Frame produced by python-zstandard for b"payload" (CPython 3.12 oracle).
+	frame, _ := hex.DecodeString("28b52ffd20073900007061796c6f6164")
+	headers := mustObj(t, `{"content-encoding":"zstd"}`)
+	out, ok, err := DecodeRequestBody(frame, headers)
+	if err != nil || !ok || string(out) != "payload" {
+		t.Fatalf("zstd decode = %q, %v, %v", out, ok, err)
+	}
+	if _, present := headers.Get("content-encoding"); present {
+		t.Fatal("Content-Encoding must be removed after a successful decode")
+	}
+}
+
+func TestDecodeRequestBodyZstdFailureReturnsBodyUnchanged(t *testing.T) {
+	// Truncated frame: python-zstandard raises, so the body is kept as is.
+	frame, _ := hex.DecodeString("28b52ffd20073900007061796c6f6164")
+	body := frame[:len(frame)-2]
+	headers := mustObj(t, `{"content-encoding":"zstd"}`)
+	out, ok, err := DecodeRequestBody(body, headers)
+	if err != nil || ok || string(out) != string(body) {
+		t.Fatalf("truncated zstd = %q, %v, %v; want the body unchanged", out, ok, err)
 	}
 }

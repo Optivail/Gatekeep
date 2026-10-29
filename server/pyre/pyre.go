@@ -39,6 +39,18 @@ type Regexp struct {
 
 	// re2 runs the pattern when RE2 is exact for it. nil otherwise.
 	re2 *regexp.Regexp
+	// reASCII is the RE2 form that also handles \b and \B. It runs only on
+	// ASCII input. nil when the pattern has no such assertions or RE2 is not exact.
+	reASCII *regexp.Regexp
+	// nonNull is set when the pattern can never match the empty string. For
+	// such patterns CPython's scan and RE2's all-matches iteration agree, so
+	// the scan can run on RE2.
+	nonNull bool
+	// run is set for [set]{min,} patterns. They skip RE2 (see runs.go).
+	run *runPattern
+	// prefix is the lower-case ASCII literal every match starts with, or "".
+	// See prefix.go.
+	prefix string
 	// bt runs every search; it is the reference engine for all patterns.
 	bt *regexp2.Regexp
 
@@ -65,12 +77,21 @@ func MustCompile(pattern string, flags ...Flags) *Regexp {
 		panic("pyre: cannot compile " + pattern + ": " + err.Error())
 	}
 	re.bt = bt
+	re.nonNull = !canBeEmpty(root)
+	re.run = runFor(root)
+	re.prefix = asciiPrefix(literalPrefix(root))
 	if !needsBacktrack(root) {
 		r2, err := regexp.Compile(emitRE2(root))
 		if err != nil {
 			panic("pyre: RE2 rejects " + pattern + ": " + err.Error())
 		}
 		re.re2 = r2
+	} else if !needsBacktrackASCII(root) {
+		r2, err := regexp.Compile(emitRE2ASCII(root))
+		if err != nil {
+			panic("pyre: RE2 rejects " + pattern + ": " + err.Error())
+		}
+		re.reASCII = r2
 	}
 	return re
 }
@@ -235,6 +256,9 @@ func (re *Regexp) FindSubmatchIndex(s string) []int {
 // FindAllIndex is re.finditer/findall. It returns [start, end] byte offsets
 // of the whole match. n < 0 returns all matches; n >= 0 returns at most n.
 func (re *Regexp) FindAllIndex(s string, n int) [][]int {
+	if locs, ok := re.allRE2(s, n); ok {
+		return locs
+	}
 	sub := newSubject(s)
 	var out [][]int
 	re.scan(sub, n, func(lo, hi int) {
@@ -255,9 +279,18 @@ func (re *Regexp) SubN(repl, s string, count int) string {
 	} else if count < 0 {
 		return s
 	}
-	sub := newSubject(s)
 	var b strings.Builder
 	prev := 0
+	if locs, ok := re.allRE2(s, limit); ok {
+		for _, loc := range locs {
+			b.WriteString(s[prev:loc[0]])
+			b.WriteString(repl)
+			prev = loc[1]
+		}
+		b.WriteString(s[prev:])
+		return b.String()
+	}
+	sub := newSubject(s)
 	re.scan(sub, limit, func(lo, hi int) {
 		b.WriteString(s[prev:sub.byteOff(lo)])
 		b.WriteString(repl)
@@ -280,14 +313,88 @@ func (re *Regexp) Split(s string, maxsplit int) []string {
 	} else if maxsplit < 0 {
 		limit = 0
 	}
-	sub := newSubject(s)
 	var out []string
 	prev := 0
+	if locs, ok := re.allRE2(s, limit); ok {
+		for _, loc := range locs {
+			out = append(out, s[prev:loc[0]])
+			prev = loc[1]
+		}
+		return append(out, s[prev:])
+	}
+	sub := newSubject(s)
 	re.scan(sub, limit, func(lo, hi int) {
 		out = append(out, s[prev:sub.byteOff(lo)])
 		prev = sub.byteOff(hi)
 	})
 	return append(out, s[prev:])
+}
+
+// allRE2 returns every match of re in s as [start, end] byte offsets, the
+// way scan would find them, when RE2 gives the same answer. That holds when
+// the pattern is exact in RE2 (re2 is set), it cannot match the empty string
+// (nonNull), and the input is valid UTF-8 without WTF-8 surrogates. RE2's
+// all-matches iteration then sees the same leftmost-first matches and the
+// same context before each search position. n is scan's limit: negative
+// means no limit. ok is false when the scan must run on regexp2.
+func (re *Regexp) allRE2(s string, n int) (locs [][]int, ok bool) {
+	if !re.nonNull || !utf8.ValidString(s) || hasSurrogateBytes(s) {
+		return nil, false
+	}
+	if re.prefix != "" && isASCII(s) && !containsFoldASCII(s, re.prefix) {
+		return nil, true
+	}
+	if re.run != nil {
+		if n == 0 {
+			return nil, true
+		}
+		return re.run.matches(s, n), true
+	}
+	if re.re2 != nil {
+		return re.re2.FindAllStringIndex(s, n), true
+	}
+	if re.reASCII != nil && isASCII(s) {
+		return re.reASCII.FindAllStringIndex(s, n), true
+	}
+	return nil, false
+}
+
+// isASCII reports whether s has no byte >= 0x80.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+// canBeEmpty reports whether n can match the empty string. Assertions and
+// lookarounds count as empty, which is the safe answer.
+func canBeEmpty(n *node) bool {
+	switch n.kind {
+	case nSet:
+		return false
+	case nCat:
+		for _, s := range n.subs {
+			if !canBeEmpty(s) {
+				return false
+			}
+		}
+		return true
+	case nAlt:
+		for _, s := range n.subs {
+			if canBeEmpty(s) {
+				return true
+			}
+		}
+		return false
+	case nRep:
+		return n.min == 0 || canBeEmpty(n.subs[0])
+	case nCap:
+		return canBeEmpty(n.subs[0])
+	}
+	return true
 }
 
 // decodeAt returns the code point at byte offset i and its width. It reads

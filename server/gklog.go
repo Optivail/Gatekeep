@@ -61,6 +61,12 @@ type statusRecorder struct {
 	status int
 }
 
+// Unwrap lets http.ResponseController reach the real writer, so that Flush and
+// EnableFullDuplex work for streaming responses.
+func (s *statusRecorder) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
+}
+
 func (s *statusRecorder) WriteHeader(code int) {
 	s.status = code
 	s.ResponseWriter.WriteHeader(code)

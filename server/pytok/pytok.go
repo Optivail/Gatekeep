@@ -120,13 +120,21 @@ func Encode(text string) ([]int, error) {
 	if tok := findSpecial(text); tok != "" {
 		return nil, fmt.Errorf("%w: %q", ErrDisallowedSpecial, tok)
 	}
+	text = normalizeSurrogates(text)
+	// No special token is present, so the ordinary encoder is exactly
+	// encode(text) with disallowed_special="all". encodeFast reproduces that
+	// encoder without regexp2; the tiktoken path below is the fallback.
+	if ids, ok := encodeFast(text); ok {
+		if ids == nil {
+			ids = []int{}
+		}
+		return ids, nil
+	}
 	e, err := encoding()
 	if err != nil {
 		return nil, fmt.Errorf("pytok: loading cl100k_base: %w", err)
 	}
-	// No special token is present, so the ordinary encoder is exactly
-	// encode(text) with disallowed_special="all".
-	ids := e.EncodeOrdinary(normalizeSurrogates(text))
+	ids := e.EncodeOrdinary(text)
 	if ids == nil {
 		ids = []int{}
 	}

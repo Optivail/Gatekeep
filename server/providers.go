@@ -174,10 +174,12 @@ func providerBase(envName, def string) string {
 	return strings.TrimRight(envOr(envName, def), "/")
 }
 
-// baseURLFor mirrors base_url_for for every provider this port forwards. The
-// cursor provider never reaches it: the proxy refuses cursor requests first.
+// baseURLFor mirrors base_url_for for a provider without a path. An agent.v1
+// path of the cursor provider has its own rule: see baseURLForPath.
 func baseURLFor(provider string) string {
 	switch provider {
+	case "cursor":
+		return providerBase("CURSOR_BASE_URL", "https://api2.cursor.sh")
 	case "openai":
 		return providerBase("OPENAI_BASE_URL", "https://api.openai.com")
 	case "chatgpt":

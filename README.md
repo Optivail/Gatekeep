@@ -77,9 +77,6 @@ The Python reference needs `pip install -r backend/requirements.txt`.
 
 ### Not yet ported to Go
 
-- The Cursor agent listener on port 9478 (`backend/core/cursor_agent*.py`,
-  `backend/engines/cursor_rewrite.py`). The Go server does not open that port,
-  and requests routed to the cursor provider return 501.
 - Requests the Go engines cannot reproduce byte for byte (a `python` fence in
   pruned history, zstd bodies, some Connect frames) are forwarded unmodified,
   so their upstream bytes differ from the Python backend.

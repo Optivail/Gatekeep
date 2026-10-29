@@ -114,6 +114,11 @@ func InitDB(dataDir string) error {
 	if err != nil {
 		return err
 	}
+	// One connection inside this process: several pooled connections writing at
+	// once make SQLite return SQLITE_BUSY immediately when a transaction
+	// upgrades its lock (seen as "database is locked" 500s). Cross-process
+	// access from the Python reference still uses the busy timeout.
+	db.SetMaxOpenConns(1)
 	// Python's sqlite3.connect uses a 5 second busy timeout.
 	stmts := []string{
 		"CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value INTEGER NOT NULL)",

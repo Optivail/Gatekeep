@@ -273,7 +273,12 @@ var parityE2Adapters = map[string]func(*pyjson.Object) (any, error){
 		if err != nil {
 			return nil, err
 		}
-		return []any{b64Canon(out), int64(saved)}, nil
+		norm, hasGzip := framesNorm(out)
+		_, srcGzip := framesNorm(body)
+		if hasGzip || srcGzip {
+			return []any{b64Canon(norm), nil}, nil
+		}
+		return []any{b64Canon(norm), int64(saved)}, nil
 	},
 	"wirecrush.crush_protobuf_message": func(a *pyjson.Object) (any, error) {
 		body, err := argB64(a, "body_b64")
@@ -297,7 +302,12 @@ var parityE2Adapters = map[string]func(*pyjson.Object) (any, error){
 		if err != nil {
 			return nil, err
 		}
-		return []any{b64Canon(out), stringsToAny(cats), int64(saved)}, nil
+		norm, hasGzip := framesNorm(out)
+		_, srcGzip := framesNorm(body)
+		if hasGzip || srcGzip {
+			return []any{b64Canon(norm), stringsToAny(cats), nil}, nil
+		}
+		return []any{b64Canon(norm), stringsToAny(cats), int64(saved)}, nil
 	},
 	"wirecrush.drain_crush_frames": func(a *pyjson.Object) (any, error) {
 		body, err := argB64(a, "body_b64")
@@ -310,9 +320,11 @@ var parityE2Adapters = map[string]func(*pyjson.Object) (any, error){
 		}
 		canon := make([]any, 0, len(frames))
 		for _, f := range frames {
-			canon = append(canon, b64Canon(f))
+			n, _ := framesNorm(f)
+			canon = append(canon, b64Canon(n))
 		}
-		return []any{b64Canon(rest), canon}, nil
+		restN, _ := framesNorm(rest)
+		return []any{b64Canon(restN), canon}, nil
 	},
 	"wirecrush.crush_json_body": func(a *pyjson.Object) (any, error) {
 		body, err := argB64(a, "body_b64")
@@ -331,4 +343,35 @@ var parityE2Adapters = map[string]func(*pyjson.Object) (any, error){
 	"wirecrush.crush_json_value": func(a *pyjson.Object) (any, error) {
 		return CrushJSONValue(argAny(a, "node"), argBool(a, "aggressive"))
 	},
+}
+
+// framesNorm is the decoded-payload view of a Connect body, shared with the
+// Python side (_frames_norm in engine_cases.py). Gzip-flagged frames are
+// gunzipped and the flag cleared, so the check compares the message, not the
+// gzip bytes. It reports whether any frame was gzip-flagged. Input that does
+// not parse as frames is returned unchanged.
+func framesNorm(body []byte) ([]byte, bool) {
+	frames, ok := IterFrames(body)
+	if !ok {
+		return body, false
+	}
+	hasGzip := false
+	out := make([]Frame, 0, len(frames))
+	for _, f := range frames {
+		payload := f.Payload
+		flags := f.Flags
+		if flags&0x01 != 0 {
+			hasGzip = true
+			if d, err := gzipDecompress(payload); err == nil {
+				payload = d
+				flags &^= 0x01
+			}
+		}
+		out = append(out, Frame{Flags: flags, Payload: payload})
+	}
+	enc, err := EncodeFrames(out)
+	if err != nil {
+		return body, hasGzip
+	}
+	return enc, hasGzip
 }

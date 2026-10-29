@@ -53,6 +53,7 @@ KNOWN: dict[str, str] = {
     "header:content-length": ("Python sends Content-Length for a buffered SSE body; Go streams it chunked. "
                               "Body bytes are compared and identical; only framing differs"),
     "header:keep-alive": "hop-by-hop",
+    "header:last-modified": "static file mtime on disk; differs between two checkouts, not a server behaviour",
     "header:etag": "Go static file serving omits ETag; body bytes identical (cosmetic, cache validation only)",
     "header:cache-control": ("Intentional: Go sends no-cache on every served .html, including /dashboard/ "
                              "(Python's normpath quirk skips the index)"),
@@ -144,11 +145,28 @@ class Upstream:
             _send(h, 500, "text/plain", b"boom", {})
         elif mode == "badjson":
             _send(h, 200, "application/json", b"not json at all", {})
+        elif mode == "server_config":
+            _send(h, 200, "application/connect+proto", _server_config_body(), {"x-upstream-body-sha256": digest})
         else:
             payload = json.dumps({"id": "msg_1", "type": "message", "role": "assistant",
                                   "content": [{"type": "text", "text": "ok"}],
                                   "usage": {"input_tokens": 10, "output_tokens": 1}}).encode()
             _send(h, 200, "application/json", payload, {"x-upstream-body-sha256": digest})
+
+
+_CURSOR_WIRE_TEXT = b"hello from the cursor wire test, with some text"
+
+
+def _connect_frame(flags: int, payload: bytes) -> bytes:
+    return bytes([flags]) + len(payload).to_bytes(4, "big") + payload
+
+
+def _server_config_body() -> bytes:
+    """A GetServerConfig-shaped Connect frame: agent URLs at two depths and http2_config 0."""
+    url = b"https://agentn.global.api5.cursor.sh"
+    inner = bytes([0x0A, len(url)]) + url
+    msg = bytes([0x0A, len(url)]) + url + bytes([0x38, 0x00]) + bytes([0x1A, len(inner)]) + inner
+    return b"\x00" + len(msg).to_bytes(4, "big") + msg
 
 
 def _send(h, status: int, ctype: str, body: bytes, extra: dict, chunked: bool = False) -> None:
@@ -272,14 +290,38 @@ def anthropic_body(tokens: int, seed: int, stream: bool = True, extra: dict | No
     return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
 
-def openai_chat_body(tokens: int, seed: int) -> bytes:
+def openai_chat_body(tokens: int, seed: int, stream: bool = True) -> bytes:
     msgs = [{"role": "system", "content": "You are helpful. Certainly! Sure thing."}]
     msgs += conversation(tokens, seed)
-    return json.dumps({"model": "gpt-4o", "stream": True, "messages": msgs}, ensure_ascii=False).encode()
+    return json.dumps({"model": "gpt-4o", "stream": stream, "messages": msgs}, ensure_ascii=False).encode()
+
+
+def responses_body(tokens: int, seed: int, stream: bool = False) -> bytes:
+    """OpenAI Responses API shape: an input list of role/content items, plus a long system prompt."""
+    items = [{"role": "user" if i % 2 == 0 else "assistant", "content": m["content"]}
+             for i, m in enumerate(conversation(tokens, seed))]
+    return json.dumps({"model": "gpt-5", "stream": stream, "instructions": "You are a coding agent. Certainly!",
+                       "input": items}, ensure_ascii=False).encode()
+
+
+# Realistic large bodies: 50k and 200k tokens on both providers, streaming and not.
+LARGE_CASES = [
+    ("large-anthropic-50k-stream", "POST", "/v1/messages?mode=stream", lambda: anthropic_body(50000, 101, stream=True)),
+    ("large-anthropic-50k-json", "POST", "/v1/messages?mode=json", lambda: anthropic_body(50000, 102, stream=False)),
+    ("large-anthropic-200k-stream", "POST", "/v1/messages?mode=stream", lambda: anthropic_body(200000, 103, stream=True)),
+    ("large-anthropic-200k-json", "POST", "/v1/messages?mode=json", lambda: anthropic_body(200000, 104, stream=False)),
+    ("large-openai-chat-50k-stream", "POST", "/v1/chat/completions?mode=openai_stream", lambda: openai_chat_body(50000, 105, True)),
+    ("large-openai-chat-50k-json", "POST", "/v1/chat/completions?mode=json", lambda: openai_chat_body(50000, 106, False)),
+    ("large-openai-chat-200k-stream", "POST", "/v1/chat/completions?mode=openai_stream", lambda: openai_chat_body(200000, 107, True)),
+    ("large-openai-responses-50k-json", "POST", "/v1/responses?mode=json", lambda: responses_body(50000, 108, False)),
+    ("large-openai-responses-200k-stream", "POST", "/v1/responses?mode=openai_stream", lambda: responses_body(200000, 109, True)),
+]
 
 
 def scenarios(api_key: str | None) -> list[dict]:
     big = anthropic_body(3000, 11)
+    large = [{"name": name, "method": method, "path": path, "body": make(), "headers": {"content-type": "application/json"}}
+             for name, method, path, make in LARGE_CASES]
     huge_line = json.dumps({"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "x" * 120000}]}).encode()
     unicode_msg = json.dumps({"model": "m", "max_tokens": 8, "messages": [
         {"role": "user", "content": "Ik heb een fout: éè 你好 \U0001F600 \r\n\tTab\r\nCRLF   spaces  "}]}, ensure_ascii=False).encode()
@@ -287,7 +329,7 @@ def scenarios(api_key: str | None) -> list[dict]:
                                                                 "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}}}],
                        "messages": [{"role": "user", "content": "list files"}]}).encode()
     gz_body = gzip.compress(big)
-    rows = [
+    rows = large + [
         {"name": "anthropic-small-json", "method": "POST", "path": "/v1/messages?mode=json",
          "body": anthropic_body(20, 1, stream=False), "headers": {"content-type": "application/json"}},
         {"name": "anthropic-large-stream", "method": "POST", "path": "/v1/messages?mode=stream", "body": big,
@@ -328,6 +370,16 @@ def scenarios(api_key: str | None) -> list[dict]:
         {"name": "wire-script", "method": "GET", "path": "/install/wire-agents.ps1", "body": None, "headers": {}},
         {"name": "settings-bad-post", "method": "POST", "path": "/api/settings/aggressive_enabled", "body": b"{}",
          "headers": {"content-type": "application/json"}},
+        # Cursor: GetServerConfig is rewritten; a wire Connect call is forwarded to CURSOR_BASE_URL.
+        {"name": "cursor-server-config", "method": "POST",
+         "path": "/aiserver.v1.ServerConfigService/GetServerConfig?mode=server_config", "body": b"",
+         "headers": {"content-type": "application/connect+proto"}},
+        {"name": "cursor-server-config-query", "method": "POST",
+         "path": "/aiserver.v1.ServerConfigService/GetServerConfig?mode=server_config&x=1", "body": b"\x00\x00\x00\x00\x00",
+         "headers": {"content-type": "application/connect+proto", "x-gatekeep-provider": "cursor"}},
+        {"name": "cursor-wire-connect", "method": "POST", "path": "/aiserver.v1.AiService/StreamChat?mode=json",
+         "body": _connect_frame(0, bytes([0x0A, len(_CURSOR_WIRE_TEXT)]) + _CURSOR_WIRE_TEXT),
+         "headers": {"content-type": "application/connect+proto"}},
     ]
     if api_key:
         auth_body = anthropic_body(10, 9, stream=False)
@@ -530,7 +582,10 @@ def main() -> int:
         ap.error("--go-bin or --self-check is required")
 
     upstream = Upstream()
-    base_env = {"ANTHROPIC_BASE_URL": upstream.url, "OPENAI_BASE_URL": upstream.url}
+    # The Cursor base is the same fake upstream. The agent origin is fixed, so the
+    # rewritten GetServerConfig body is identical on both servers.
+    base_env = {"ANTHROPIC_BASE_URL": upstream.url, "OPENAI_BASE_URL": upstream.url,
+                "CURSOR_BASE_URL": upstream.url, "GATEKEEP_AGENT_URL": "http://127.0.0.1:9478"}
     py_cmd = [sys.executable, "main.py"]  # no -I: the server imports its own modules from its directory
     if args.self_check:
         other_cmd, other_cwd, other_label = py_cmd, args.py_dir, "python-2"

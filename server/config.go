@@ -84,8 +84,8 @@ func urlHost(host string) string {
 	return host
 }
 
-// agentPublicURL is config.agent_public_url(). It is used for logging only;
-// the cursor listener itself is not ported yet.
+// agentPublicURL is config.agent_public_url(): the origin that GetServerConfig
+// responses are rewritten to, and that the agent listener is reached at.
 func agentPublicURL() string {
 	explicit := strings.TrimRight(strings.TrimSpace(os.Getenv("GATEKEEP_AGENT_URL")), "/")
 	if explicit != "" {
