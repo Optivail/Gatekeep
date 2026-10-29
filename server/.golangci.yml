@@ -1,0 +1,13 @@
+version: "2"
+linters:
+  settings:
+    errcheck:
+      # Close/Rollback on read paths and deferred cleanup: the error carries
+      # no information we could act on.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (*database/sql.DB).Close
+        - (*database/sql.Rows).Close
+        - (*database/sql.Tx).Rollback
+        - os.Setenv

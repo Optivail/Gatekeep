@@ -17,6 +17,14 @@ updates:
     groups:
       pip:
         patterns: ["*"]
+  - package-ecosystem: gomod
+    directory: "/server"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      gomod:
+        patterns: ["*"]
   - package-ecosystem: npm
     directory: "/frontend"
     schedule:

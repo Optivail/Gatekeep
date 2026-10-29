@@ -63,10 +63,14 @@ Manual overrides:
 ## Local dev (no Docker)
 
 ```bash
-pip install -r backend/requirements.txt
 cd frontend && npm install && npm run build
-cd ../backend && uvicorn main:app --host 127.0.0.1 --port 9477
+cd ../server && go run .
 ```
+
+The Go server is the production backend. The Python backend in `backend/` is
+kept as the reference (`pip install -r backend/requirements.txt`, then
+`cd backend && python main.py`). Cursor agent listener on 9478 is not ported
+yet (see README).
 
 Set `GATEKEEP_DEBUG=1` for verbose proxy logging.
 

@@ -21,7 +21,7 @@
 ## Requirements
 
 - **Production:** Docker and Docker Compose
-- **Development:** Python 3.12+, Node.js 22+ (frontend build), pip
+- **Development:** Go 1.27+, Node.js 22+ (frontend build); Python 3.12+ only for the parity checks
 
 Default ports: **9477** (proxy + dashboard), **9478** (Cursor agent listener).
 
@@ -51,13 +51,38 @@ Manual details: [docs/AGENTS.md](docs/AGENTS.md)
 
 ## Development
 
+The server is the Go backend in `server/` (the production build). The Python
+backend in `backend/` is kept as the reference that the Go code is checked
+against.
+
 ```bash
-pip install -r backend/requirements.txt
 cd frontend && npm install && npm run build
-cd ../backend && uvicorn main:app --host 127.0.0.1 --port 9477
+cd ../server && go run .            # listens on 9477 by default
 ```
 
 Set `GATEKEEP_DEBUG=1` for verbose proxy logging.
+
+### Parity checks
+
+```bash
+cd server
+go test -count=1 ./...                                   # unit tests
+python -I parity/engine_cases.py --out /tmp/engines.jsonl --count 5000 --seed 1
+GK_PARITY_CORPUS=/tmp/engines.jsonl go test -count=1 -run Parity ./engines   # engine byte parity
+go build -o /tmp/gatekeep-go .
+python -I parity/http_parity.py --go-bin /tmp/gatekeep-go   # HTTP parity vs the Python backend
+```
+
+The Python reference needs `pip install -r backend/requirements.txt`.
+
+### Not yet ported to Go
+
+- The Cursor agent listener on port 9478 (`backend/core/cursor_agent*.py`,
+  `backend/engines/cursor_rewrite.py`). The Go server does not open that port,
+  and requests routed to the cursor provider return 501.
+- Requests the Go engines cannot reproduce byte for byte (a `python` fence in
+  pruned history, zstd bodies, some Connect frames) are forwarded unmodified,
+  so their upstream bytes differ from the Python backend.
 
 ## Documentation
 
