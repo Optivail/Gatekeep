@@ -91,3 +91,6 @@ backend/.dump_bodies
 *.tar.gz
 *.iso
 *.bin
+
+# The frontend lockfile is committed so CI builds are reproducible
+!frontend/package-lock.json
