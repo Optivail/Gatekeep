@@ -196,11 +196,16 @@ function Hero({ stats }) {
           <div><dt>Avg latency</dt><dd className="mono"><Num value={stats?.avg_latency_ms || 0} format={(v) => `${Math.round(v)}ms`} /></dd></div>
         </dl>
       </div>
-      <div className="flow" role="img" aria-label={`${fmt(sent)} sent of ${fmt(raw)} raw tokens`}>
-        <div className="flow-bar">
-          <div className="flow-sent" style={{ width: `${sentPct}%` }} />
-          <div className="flow-crush" style={{ width: `${100 - sentPct}%` }}>{raw > 0 && <span className="flow-stripes" />}</div>
-        </div>
+      <div className="flow" role="img" aria-label={raw ? `${fmt(sent)} sent of ${fmt(raw)} raw tokens` : 'No traffic yet'}>
+        {raw > 0 ? (
+          <div className="flow-bar">
+            <div className="flow-sent" style={{ width: `${sentPct}%` }}><span className="flow-in mono">sent {fmt(sent)}</span></div>
+            <div className="flow-crush" style={{ width: `${100 - sentPct}%` }}><span className="flow-stripes" /><span className="flow-in mono">crushed {fmt(saved)}</span></div>
+          </div>
+        ) : (
+          // No traffic: an empty track with a hint, not a full bar that reads as "nothing saved".
+          <div className="flow-bar flow-empty"><span className="flow-in">No traffic in this period · point a CLI at Gatekeep (Docs)</span></div>
+        )}
         <div className="flow-legend mono">
           <span><i className="k-raw" />raw <b><Num value={raw} /></b></span>
           <span><i className="k-sent" />sent <b><Num value={sent} /></b></span>
@@ -256,9 +261,9 @@ function Agents({ stats, agent, onAgent }) {
   return (
     <section className="card rise">
       <div className="sec-head"><h2>Saved by agent</h2>{agent !== 'all' && <button type="button" className="link" onClick={() => onAgent('all')}>Show all agents</button>}</div>
-      <div className="agent-bar" role="img" aria-label="Savings by agent">
+      <div className="agent-bar" role="group" aria-label="Savings by agent">
         {list.map((a) => a.pct_of_total_saved > 0 && (
-          <button key={a.agent} type="button" title={`${a.label}: ${fmt(a.total_tokens_saved)} (${a.pct_of_total_saved}%)`} className={agent !== 'all' && agent !== a.agent ? 'dim' : ''} style={{ width: `${a.pct_of_total_saved}%`, background: agentColor(a.agent) }} onClick={() => onAgent(agent === a.agent ? 'all' : a.agent)} />
+          <button key={a.agent} type="button" title={`${a.label}: ${fmt(a.total_tokens_saved)} (${a.pct_of_total_saved}%)`} aria-label={`${a.label}: ${fmt(a.total_tokens_saved)} saved, ${a.pct_of_total_saved}%`} className={agent !== 'all' && agent !== a.agent ? 'dim' : ''} style={{ width: `${a.pct_of_total_saved}%`, background: agentColor(a.agent) }} onClick={() => onAgent(agent === a.agent ? 'all' : a.agent)} />
         ))}
       </div>
       <div className="agent-grid">
@@ -515,10 +520,19 @@ export default function App() {
       )}
 
       <main className="page" key={view}>
-        {view === 'overview' && (
+        {view === 'overview' && !stats && error && (
+          // API down and nothing loaded yet: say so, instead of zeros that read as "nothing saved".
+          <section className="card rise offline-card" role="status">
+            <p className="eyebrow">Effective headroom</p>
+            <h1>Can't reach the Gatekeep API</h1>
+            <p className="muted">The proxy did not answer ({error}). This page retries every {POLL / 1000} s; nothing is lost.</p>
+          </section>
+        )}
+        {view === 'overview' && (stats || !error) && (
           <div className="stack">
-            <Quotas usage={stats?.subscription_usage} agent={agent} />
             <Hero stats={stats} />
+            <div className="ov-grid">
+            <div className="ov-main">
             <div className="metrics">
               {METRICS.map((m, i) => (
                 <button key={m.id} type="button" className={`metric ${metricId === m.id ? 'on' : ''}`} style={{ '--i': i }} onClick={() => setMetricId(m.id)} aria-pressed={metricId === m.id}>
@@ -533,11 +547,14 @@ export default function App() {
               <div className="sec-head"><h2>{metric.label}</h2><span className="muted mono">{series.length} buckets · {stats?.granularity || ''}</span></div>
               <Chart series={series} metric={metric} />
             </section>
-            <div className="split">
-              <LiveFeed logs={logs} onOpen={setSelected} seen={seen} />
-              <Techniques stats={stats} filter={technique} onPick={pickTechnique} />
+            <LiveFeed logs={logs} onOpen={setSelected} seen={seen} />
             </div>
-            <Agents stats={stats} agent={agent} onAgent={setAgent} />
+            <aside className="ov-side" aria-label="Limits and breakdown">
+              <Quotas usage={stats?.subscription_usage} agent={agent} />
+              <Agents stats={stats} agent={agent} onAgent={setAgent} />
+              <Techniques stats={stats} filter={technique} onPick={pickTechnique} />
+            </aside>
+            </div>
           </div>
         )}
 
